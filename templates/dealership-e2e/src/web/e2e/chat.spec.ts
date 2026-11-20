@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 
 /**
  * End-to-end coverage for the driveline-web chat UI, run against
- * `next dev` in forced mock mode (see playwright.config.ts) so results are
+ * a production build in forced mock mode (see playwright.config.ts) so results are
  * deterministic and independent of the real deal-finder agent.
  *
  * The multi-turn test below is a regression test for the conversation-
@@ -10,8 +10,7 @@ import { expect, test } from "@playwright/test";
  * `/api/chat`, so the agent had no memory of prior turns. The fix sends the
  * full message history on every request; this test exercises that by
  * asserting the full transcript (both prior turns) is still present in the
- * DOM after a second turn, and that mock-agent stage transitions still
- * behave correctly across turns.
+ * DOM after a second turn.
  */
 
 test.describe("deal-finder chat", () => {
@@ -19,8 +18,9 @@ test.describe("deal-finder chat", () => {
     await page.goto("/");
 
     await expect(page.getByTestId("chat-message-assistant").first()).toContainText(
-      "Hi Paul"
+      "Application submission is not connected yet."
     );
+    await expect(page.getByText("Demo conversation")).toBeVisible();
   });
 
   test("shortlists vehicles for a car-shopping prompt", async ({ page }) => {
@@ -58,7 +58,7 @@ test.describe("deal-finder chat", () => {
     // NEXT_PUBLIC_MOCK=1 in this test run forces every reply through the
     // mock scenario generator — the badge must say so plainly, never
     // silently look like a live-agent reply.
-    await expect(page.getByTestId("reply-source-badge")).toContainText("Mock agent");
+    await expect(page.getByTestId("reply-source-badge")).toHaveText("Mock agent");
     const icon = page.getByTestId("reply-source-badge").locator("svg.octicon-alert");
     await expect(icon).toBeVisible();
     await expect(icon).toHaveAttribute("aria-hidden", "true");
@@ -76,14 +76,16 @@ test.describe("deal-finder chat", () => {
 
   for (const [source, icon, label] of [
     ["agent", "dot-fill", "Live agent"],
-    ["agent_error", "x-circle", "Live agent reachable, turn failed"],
+    ["agent_error", "x-circle", "Live agent request failed"],
   ] as const) {
     test(`uses the official ${icon} icon for ${source} replies`, async ({ page }) => {
       await page.route("**/api/chat", (route) => route.fulfill({
         contentType: "application/x-ndjson",
         body: [
           { type: "source", value: source },
-          { type: "token", value: "A test response." },
+          source === "agent_error"
+            ? { type: "error", value: "Could not reach the live agent." }
+            : { type: "token", value: "A test response." },
           { type: "done" },
         ].map((event) => JSON.stringify(event)).join("\n") + "\n",
       }));
@@ -92,6 +94,11 @@ test.describe("deal-finder chat", () => {
       await page.getByTestId("chat-send").click();
       const badge = page.getByTestId("reply-source-badge");
       await expect(badge).toContainText(label);
+      if (source === "agent_error") {
+        await expect(page.getByTestId("chat-message-assistant").last()).toContainText(
+          "Could not reach the live agent."
+        );
+      }
       await expect(badge.locator(`svg.octicon-${icon}`)).toBeVisible();
       await expect(badge.locator("svg")).toHaveAttribute("aria-hidden", "true");
     });
@@ -195,32 +202,52 @@ test.describe("deal-finder chat", () => {
     expect(bubbleText).not.toContain("| ---");
   });
 
-  test("submits an application and reflects the pending-approval stage", async ({
+  test("does not claim an application was submitted or approved without a workflow", async ({
     page
   }) => {
     await page.goto("/");
 
-    await page.getByTestId("chat-input").fill(
-      "Find me an EV under $40,000 with at least 250 miles of range"
-    );
-    await page.getByTestId("chat-send").click();
-    await expect(page.getByTestId("chat-message-assistant").last()).toContainText(
-      "three EVs",
-      { timeout: 10_000 }
-    );
-    // Wait for the streaming turn to fully finish (isStreaming -> false)
-    // before interacting with Apply — the "done" event and the disabling
-    // state update happen after the last "token" event.
-    await expect(page.getByTestId("chat-input")).toBeEnabled();
-
+    let releaseReply!: () => void;
+    const replyHeld = new Promise<void>((resolve) => { releaseReply = resolve; });
+    await page.route("**/api/chat", async (route) => {
+      if (!route.request().postDataJSON().command) {
+        await replyHeld;
+      }
+      await route.continue();
+    });
+    await page.getByTestId("chat-input").fill("hello");
+    await Promise.all([
+      page.waitForRequest((request) => request.url().endsWith("/api/chat")),
+      page.getByTestId("chat-send").click()
+    ]);
     await page.getByLabel("Customer email").fill("paul@example.com");
     const applyButton = page.getByRole("button", { name: "Apply" });
-    await expect(applyButton).toBeEnabled();
-    await applyButton.click();
-
+    try {
+      await expect(applyButton).toBeDisabled();
+    } finally {
+      releaseReply();
+    }
     await expect(page.getByTestId("chat-message-assistant").last()).toContainText(
-      "Application submitted",
+      "Application submission is not connected.",
       { timeout: 10_000 }
     );
+
+    await expect(applyButton).toBeEnabled();
+    await page.clock.install();
+    const [response] = await Promise.all([
+      page.waitForResponse((response) =>
+        response.url().endsWith("/api/chat") && response.request().postDataJSON().command === "apply"
+      ),
+      applyButton.click()
+    ]);
+    expect(response.status()).toBe(200);
+    await expect(page.getByTestId("chat-message-assistant").last()).toContainText(
+      "Application submission is not connected. No application was sent.",
+      { timeout: 10_000 }
+    );
+    await expect(page.getByTestId("reply-source-badge")).toHaveText("Approval unavailable");
+    await expect(applyButton).toBeEnabled();
+    await page.clock.fastForward(8_000);
+    await expect(page.locator("li[aria-current='step']")).toHaveCount(0);
   });
 });

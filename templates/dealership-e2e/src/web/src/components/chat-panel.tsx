@@ -86,7 +86,7 @@ export function ChatPanel({ messages, isStreaming, onSend }: ChatPanelProps) {
     <Card className="rounded-token-2xl border border-border bg-surface-elev shadow-token-2">
       <header className="border-b border-border px-5 py-4">
         <h2 className="font-display text-lg font-semibold text-ink">Deal finder chat</h2>
-        <p className="text-sm text-ink-muted">Signed in as Paul</p>
+        <p className="text-sm text-ink-muted">Demo conversation</p>
       </header>
 
       {!hasUserMessage && (

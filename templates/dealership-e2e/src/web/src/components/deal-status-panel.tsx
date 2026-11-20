@@ -12,6 +12,7 @@ interface DealStatusPanelProps {
   onEmailChange: (value: string) => void;
   onApply: () => Promise<void>;
   isApplying: boolean;
+  isStreaming: boolean;
 }
 
 const STAGES: Array<{ id: DealStage; label: string }> = [
@@ -37,13 +38,14 @@ export function DealStatusPanel({
   email,
   onEmailChange,
   onApply,
-  isApplying
+  isApplying,
+  isStreaming
 }: DealStatusPanelProps) {
   return (
     <Card className="rounded-token-2xl border border-border bg-surface-elev p-5 shadow-token-2">
       <h3 className="font-display text-lg font-semibold text-ink">Deal workflow</h3>
       <p className="mt-1 text-sm text-ink-muted">
-        Capture customer email and submit for approval.
+        Application submission is not connected yet.
       </p>
 
       <div className="mt-4 space-y-2">
@@ -66,7 +68,7 @@ export function DealStatusPanel({
 
       <Button
         className="mt-4 w-full rounded-token-lg bg-status-success px-4 py-2 text-sm font-semibold text-white transition hover:opacity-90 data-[disabled=true]:opacity-50"
-        disabled={!isValidEmail(email) || isApplying}
+        disabled={!isValidEmail(email) || isApplying || isStreaming}
         onClick={onApply}
       >
         {isApplying ? "Submitting…" : "Apply"}
@@ -82,6 +84,7 @@ export function DealStatusPanel({
           return (
             <li
               key={item.id}
+              aria-current={isCurrent ? "step" : undefined}
               className={`rounded-token-lg border px-3 py-2 text-sm font-medium ${
                 isCurrent
                   ? "border-status-warning bg-status-warning-soft text-status-warning"

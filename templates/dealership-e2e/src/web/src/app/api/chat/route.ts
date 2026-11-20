@@ -31,12 +31,15 @@ export async function POST(request: Request) {
   // reflect a same-request fallback when the agent is unreachable).
   let source: ReplySource;
 
-  if (forceMock) {
+  if (body.command === "apply") {
+    source = "workflow_unavailable";
+    agentError = "Application submission is not connected. No application was sent.";
+    scenario = { assistantReply: "", stage: body.stage ?? "idle" };
+  } else if (forceMock) {
     source = "mock";
     scenario = buildMockScenario({
       latestMessage,
       email: body.email,
-      command: body.command,
       stage: body.stage
     });
   } else {
@@ -62,7 +65,6 @@ export async function POST(request: Request) {
         scenario = buildMockScenario({
           latestMessage,
           email: body.email,
-          command: body.command,
           stage: body.stage
         });
       } else {

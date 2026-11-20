@@ -649,6 +649,15 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn("session_stopped=false" if cleanup_error else "session_stopped=true", logs.getvalue())
             self.assertNotIn("fixture-never-log", logs.getvalue())
 
+    def test_local_tool_processes_safe_document_without_host_credentials(self):
+        with patch.dict(os.environ, {"AI_GATEWAY_API_KEY": "host-only-fixture-key"}):
+            result = agent.LocalDocumentTool(10).process({"name": "note.txt", "content": "Safe synthetic text."})
+
+        self.assertEqual(result["verdict"], "approved")
+        self.assertEqual(result["document"]["sanitizedText"], "Safe synthetic text.")
+        self.assertEqual(result["sandboxProbe"]["credentialLikeVariableCount"], 0)
+        self.assertNotIn("host-only-fixture-key", str(result))
+
     def test_local_probe_exercises_socket_policy_and_never_reaches_listener_or_model(self):
         requests = []
 

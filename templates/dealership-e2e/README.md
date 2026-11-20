@@ -1,6 +1,9 @@
 # Dealership E2E Reference Sample
 
-Complete multi-tier reference application for **Azure App Platform**: a conversational car-buying experience (`driveline-web` on App Service Builder) backed by the `deal-finder` hosted agent, **Azure AI Gateway** governing model and MCP tool traffic, four **Azure Functions Hosted Skills** (`inventory-search`, `trade-in-value`, `rate-sheet`, `deal-doc`), an isolated **ACA Sandbox** (`prequal`) for PII-safe loan pre-qualification, **Durable Task Scheduler (DTS)** human-in-the-loop approval workflows (`LoanApprovalOrchestrator` and `InventoryReplenishmentOrchestrator`), and **Azure SRE Agent** operational self-awareness.
+Local reference app for **Azure App Platform**. It includes a car-buying chat,
+the `deal-finder` agent, and four Hosted Skills. The sandbox and workflow
+examples are not connected to the web app. The cloud infrastructure is a
+precursor and is not ready for an end-to-end deployment.
 
 ## Quickstart (Mock Mode, No Azure Subscription Needed)
 
@@ -16,9 +19,12 @@ Open `http://localhost:3000` and try:
 Find me an EV under $40,000 with at least 250 miles of range
 ```
 
+Mock replies use sample data. They do not submit applications, send approvals,
+or run a sandbox.
+
 ## Full Local Stack (Azurite + 4 Hosted Skills + Agent + Web)
 
-1. Provision or connect an Azure AI Gateway so `src/agent/.env` contains `AI_GATEWAY_BASE_URL`, `AI_GATEWAY_API_KEY`, and `AI_GATEWAY_MODEL` (see [`src/README.md`](src/README.md) and [`TESTING.md`](TESTING.md)).
+1. Provision or connect an Azure AI Gateway so `src/agent/.env` contains `AZURE_AI_GATEWAY_ENDPOINT`, `AZURE_AI_GATEWAY_API_KEY`, and `AZURE_AI_GATEWAY_MODEL` (see [`src/README.md`](src/README.md) and [`TESTING.md`](TESTING.md)).
 2. Start the full stack:
    - macOS / Linux:
      ```bash
@@ -43,8 +49,8 @@ Find me an EV under $40,000 with at least 250 miles of range
 - `src/web/`: Next.js buyer chat & vehicle shortlist UI (`builder.yaml` for App Service Builder)
 - `src/agent/`: Python Microsoft Agent Framework hosted agent (`deal-finder`, Responses protocol)
 - `src/skills/`: Four Azure Functions MCP Hosted Skills (`inventory-search`, `trade-in-value`, `rate-sheet`, `deal-doc`)
-- `src/sandbox/prequal/`: Hardware-isolated ACA Sandbox container for PII loan pre-qualification with default-deny egress
-- `src/workflows/loan-approval/`: Durable Functions + DTS orchestrations for manager deal approval and inventory replenishment
+- `src/sandbox/prequal/`: Synthetic pre-qualification example; ACA isolation requires separate configuration
+- `src/workflows/loan-approval/`: Durable Functions workflow examples; Teams delivery is a stub
 - `infra-ai-gateway/`: Standalone `azd` + Bicep deployment for Azure AI Gateway and Foundry model deployments
-- `infra/`: Modular Bicep infrastructure across all platform capabilities
+- `infra/`: Incomplete Bicep infrastructure precursor
 - `TESTING.md`: End-to-end local and live verification guide

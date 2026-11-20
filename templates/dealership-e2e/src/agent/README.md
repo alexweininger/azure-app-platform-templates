@@ -64,7 +64,7 @@ curl -sS -X POST http://127.0.0.1:8088/responses \
 ```
 
 The server uses port `8088` by default and honors `AGENT_PORT`. Model calls
-always go to the real AI Gateway. **Tool calls also always work**:
+go to the configured AI Gateway. Tool calls need a reachable tool source:
 if `TOOLBOX_ENDPOINT` is set (a real Foundry Toolbox has been provisioned and
 registered: see `src/skills/README.md`), the agent uses it; otherwise it
 connects to the four Hosted Skills over real MCP at `http://localhost:707{1..4}`
@@ -74,6 +74,9 @@ connects to the four Hosted Skills over real MCP at `http://localhost:707{1..4}`
 repository-level launchers set all five values from
 `.azure-app-platform/ports.env`, so no manual wiring is needed. See the
 repository-root `TESTING.md` for the verified response and all PR test paths.
+The agent does not start if a tool source cannot connect, exposes no tools,
+or exposes a tool name already used by another source. Check the startup
+diagnostics and fix the listed sources before retrying.
 
 ## Manual local configuration
 

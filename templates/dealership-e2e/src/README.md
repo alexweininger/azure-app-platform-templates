@@ -112,15 +112,10 @@ so you don't have to retype it:
 Find me an EV under $40,000 with at least 250 miles of range
 ```
 
-Watch the badge in the top-right of the page header: it reads the actual
-per-response `source` reported by `/api/chat`, not a guess from env vars : 
-**"Live agent"** with an Octicon dot (green) means the reply came from the real agent, while
-**"Mock agent (no live agent reachable)"** with an Octicon alert (amber) means it silently fell
-back because nothing is listening on the agent port, and **"Live agent
-reachable, turn failed"** with an Octicon error (red) means the agent process itself answered but
-the turn failed server-side: most commonly its MCP tool sources (the
-Hosted Skills below) aren't connected yet. The chat bubble shows the actual
-error message in that case; see "Start the Hosted Skills locally" below.
+The badge reports the source of each response. **"Live agent"** means the
+reply came from the agent. **"Mock agent"** means the reply used sample data.
+**"Live agent request failed"** means the agent request failed; the chat
+shows the error. **"Approval unavailable"** means no application was sent.
 
 To force one mode instead of auto-detecting, set `NEXT_PUBLIC_MOCK` in
 `src/web/.env.local` (copy from `.env.example`): `1` always mocks,
@@ -137,7 +132,8 @@ its own port: it does **not** run them in-process or fall back silently.
 Watch the agent's own startup log for a `CONNECTED, discovered N tool(s)` or
 `FAILED to connect/discover tools` line per skill; that tells you immediately
 which of the four (if any) aren't up, without needing a tool-using prompt
-first.
+first. The agent stops at startup if a source cannot connect, exposes no
+tools, or exposes a duplicate tool name.
 
 One-time configuration per skill (repeat for all four: `inventory-search`,
 `trade-in-value`, `rate-sheet`, `deal-doc`). Dependency setup is automatic:

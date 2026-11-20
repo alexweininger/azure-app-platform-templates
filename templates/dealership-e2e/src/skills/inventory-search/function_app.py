@@ -23,44 +23,41 @@ async def _strip_placeholder_bearer_auth(self, request):
 
 AsyncOpenAI._prepare_request = _strip_placeholder_bearer_auth
 
-import json
 import azure.functions as func
-from tools.inventory_search import apply_inventory_restock, evaluate_inventory_health
+from azurefunctions.extensions.http.fastapi import JSONResponse, Request
+from tools._inventory_core import apply_inventory_restock, evaluate_inventory_health
 
 app = create_function_app()
 
 
 @app.route(route="inventory/health", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
-def get_inventory_health(req):
-    raw_threshold = req.params.get("threshold")
-    threshold_override = int(raw_threshold) if raw_threshold and raw_threshold.isdigit() else None
+async def get_inventory_health(req: Request) -> JSONResponse:
+    raw_threshold = req.query_params.get("threshold")
+    if raw_threshold is not None and not raw_threshold.isdigit():
+        return JSONResponse({"error": "threshold must be a non-negative integer"}, status_code=400)
+    threshold_override = int(raw_threshold) if raw_threshold is not None else None
     report = evaluate_inventory_health(threshold_override=threshold_override)
-    return func.HttpResponse(
-        body=json.dumps(report),
-        status_code=200,
-        mimetype="application/json",
-    )
+    return JSONResponse(report)
 
 
-@app.route(route="inventory/restock", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
-def post_inventory_restock(req):
+@app.route(route="inventory/restock", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+async def post_inventory_restock(req: Request) -> JSONResponse:
     try:
-        payload = req.get_json()
-    except ValueError:
-        payload = {}
+        payload = await req.json()
+    except (ValueError, UnicodeDecodeError):
+        return JSONResponse({"error": "Request body must be valid JSON"}, status_code=400)
     if not isinstance(payload, dict):
-        payload = {}
+        return JSONResponse({"error": "Request body must be an object"}, status_code=400)
+    approved_by = payload.get("approvedBy")
+    if not isinstance(approved_by, str) or not approved_by.strip():
+        return JSONResponse({"error": "approvedBy is required"}, status_code=400)
     vehicles = payload.get("vehicles")
-    if not isinstance(vehicles, list):
-        vehicles = None
+    if vehicles is not None and not isinstance(vehicles, list):
+        return JSONResponse({"error": "vehicles must be an array"}, status_code=400)
     result = apply_inventory_restock(
         vehicles,
         order_id=payload.get("orderId"),
-        approved_by=payload.get("approvedBy"),
+        approved_by=approved_by.strip(),
     )
-    return func.HttpResponse(
-        body=json.dumps(result),
-        status_code=200,
-        mimetype="application/json",
-    )
+    return JSONResponse(result)
 

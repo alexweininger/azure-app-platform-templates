@@ -94,6 +94,8 @@ Tooling and governance rules:
 - Use gpt-mini-latest for simple classification/filtering turns.
 - Use gpt-latest for final synthesis and customer-facing summaries.
 - Never expose secrets. Never claim a tool result you did not receive.
+- Application submission, approval, and email delivery are not connected.
+  Do not claim they happened; tell users they are unavailable.
 """
 
 
@@ -200,7 +202,12 @@ async def _diagnose_mcp_tools(tools: list) -> bool:
     PASS/FAIL lines, means a broken skill is visible in agent stdout before
     the web app ever sends a request.
     """
+    if not tools:
+        logger.error("No MCP tool sources are configured.")
+        return False
+
     all_ok = True
+    tool_names = {}
     for tool in tools:
         tool_name = getattr(tool, "name", tool.__class__.__name__)
         tool_url = getattr(tool, "url", None)
@@ -209,12 +216,25 @@ async def _diagnose_mcp_tools(tools: list) -> bool:
             await tool.connect()
             await tool.load_tools()
             function_names = [fn.name for fn in tool.functions]
+            if not function_names:
+                all_ok = False
+                logger.error("MCP tool '%s'%s: connected but discovered no tools.", tool_name, location)
+                continue
+            for name in function_names:
+                if name in tool_names:
+                    all_ok = False
+                    logger.error(
+                        "MCP tool '%s'%s: duplicate tool name '%s' also exposed by '%s'.",
+                        tool_name, location, name, tool_names[name],
+                    )
+                else:
+                    tool_names[name] = tool_name
             logger.info(
                 "MCP tool '%s'%s: CONNECTED, discovered %d tool(s): %s",
                 tool_name,
                 location,
                 len(function_names),
-                ", ".join(function_names) if function_names else "(none)",
+                ", ".join(function_names),
             )
         except Exception as exc:  # noqa: BLE001 - report every failure, don't stop at the first
             all_ok = False
@@ -243,15 +263,12 @@ def build_agent() -> Agent:
     )
     tools_ok = asyncio.run(_diagnose_mcp_tools(tools))
     if not tools_ok:
-        logger.warning(
-            "One or more MCP tool sources failed to connect at startup. "
-            "The agent will still start, but tool-dependent requests will fail "
-            "with 'MCP server failed to initialize' until this is fixed. "
-            "For local Hosted Skills, see src/skills/README.md 'Run the Hosted "
-            "Skills locally' (each skill needs `func start` on its own port)."
+        raise RuntimeError(
+            "Cannot start deal-finder: one or more MCP tool sources failed to connect "
+            "or expose unique tools. Check the tool diagnostics above and the Hosted Skills "
+            "or Foundry Toolbox configuration."
         )
-    else:
-        logger.info("All MCP tool sources connected successfully.")
+    logger.info("All MCP tool sources connected successfully.")
 
     return Agent(
         client=_gateway_client(),

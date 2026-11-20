@@ -9,7 +9,7 @@ This is tier **① Surface** from the platform plan, implemented as a TypeScript
 - `/api/chat` route that auto-detects the real `deal-finder` agent, falling
   back to a mock scenario generator for a fully standalone demo flow
 - Vehicle shortlist results grid
-- Deal status panel (pending Teams approval → approved → offer emailed)
+- Deal status panel. Application submission and approval are not connected.
 - `builder.yaml` manifest for Azure App Service Builder (`standalone` Next.js runtime and `/api/health` readiness check)
 
 ## Run locally
@@ -67,8 +67,8 @@ Find me an EV under $40,000 with at least 250 miles of range
 Watch the badge in the top-right of the page header: it reflects the
 actual per-response `source` reported by `/api/chat`, not a guess from env
 vars: **"Live agent"** with an Octicon dot (green) means the reply came from the real
-agent, while **"Mock agent (no live agent reachable)"** with an Octicon alert (amber) means it
-silently fell back.
+agent, while **"Mock agent"** with an Octicon alert (amber) means the reply
+used sample data, either by configuration or fallback.
 
 Authored status and copy-feedback icons use the official
 `@primer/octicons-react` package. Message content is not rewritten. The car
@@ -89,11 +89,12 @@ cd src/web
 npm install
 npx playwright install --with-deps chromium  # first run only
 npm run test:e2e
+npm run test:e2e:dev
 ```
 
-Runs against a production build (`next build && next start`) in forced mock
-mode (`NEXT_PUBLIC_MOCK=1`), so results are deterministic and independent of
-the real deal-finder agent. Covers the chat flow, vehicle shortlisting, the
-apply-and-approve workflow, the mock/live reply-source badge, and: as a
-regression test: that the full message history (not just the latest turn)
-is sent to `/api/chat` on every request.
+The first command tests a production build. The second tests the development
+server at `127.0.0.1`. Both use forced mock mode (`NEXT_PUBLIC_MOCK=1`), so
+they do not require the real agent. The production checks cover chat,
+shortlisting, unavailable application submission, reply-source badges, and
+conversation history. The development check also verifies that an untrusted
+origin cannot load development assets.

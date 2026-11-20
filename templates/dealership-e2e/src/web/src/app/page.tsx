@@ -18,7 +18,7 @@ export default function HomePage() {
       id: makeId(),
       role: "assistant",
       content:
-        "Hi Paul 👋 I can help you find the right EV, estimate payments, and submit your application."
+        "Hi! I can help you find the right EV and estimate payments. Application submission is not connected yet."
     }
   ]);
   const [vehicles, setVehicles] = useState<Vehicle[]>([]);
@@ -134,11 +134,11 @@ export default function HomePage() {
     }
 
     setIsApplying(true);
-    await runTurn(`Apply now. My email is ${email}.`, "apply");
-
-    window.setTimeout(() => setStage("approved"), 3500);
-    window.setTimeout(() => setStage("offer_emailed"), 7000);
-    setIsApplying(false);
+    try {
+      await runTurn(`Apply now. My email is ${email}.`, "apply");
+    } finally {
+      setIsApplying(false);
+    }
   }
 
   return (
@@ -162,7 +162,7 @@ export default function HomePage() {
                   <AlertIcon size={16} aria-hidden="true" />
                 ) : lastSource === "agent" ? (
                   <DotFillIcon size={16} aria-hidden="true" />
-                ) : lastSource === "agent_error" ? (
+                ) : lastSource === "agent_error" || lastSource === "workflow_unavailable" ? (
                   <XCircleIcon size={16} aria-hidden="true" />
                 ) : undefined
               }
@@ -171,18 +171,20 @@ export default function HomePage() {
                   ? "bg-status-warning text-white"
                   : lastSource === "agent"
                     ? "bg-status-success text-white"
-                    : lastSource === "agent_error"
+                    : lastSource === "agent_error" || lastSource === "workflow_unavailable"
                       ? "bg-status-danger text-white"
                       : "bg-accent text-accent-contrast"
               }`}
             >
               {lastSource === "mock"
-                ? "Mock agent (no live agent reachable)"
+                ? "Mock agent"
                 : lastSource === "agent"
                   ? "Live agent"
                   : lastSource === "agent_error"
-                    ? "Live agent reachable, turn failed (see error)"
-                    : "Waiting for first reply…"}
+                    ? "Live agent request failed"
+                    : lastSource === "workflow_unavailable"
+                      ? "Approval unavailable"
+                      : "Waiting for first reply…"}
             </Badge>
           </div>
         </div>
@@ -196,6 +198,7 @@ export default function HomePage() {
           onEmailChange={setEmail}
           onApply={handleApply}
           isApplying={isApplying}
+          isStreaming={isStreaming}
         />
       </div>
 

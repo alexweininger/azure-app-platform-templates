@@ -1,10 +1,11 @@
 import unittest
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from agent_framework import ChatResponse, Content, Message, ResponseStream, UsageDetails
 from agent_framework.openai import OpenAIChatClient
 
-from main import BufferedGatewayChatClient, _local_skill_tools
+from main import BufferedGatewayChatClient, _diagnose_mcp_tools, _local_skill_tools, build_agent
 from local_ports import agent_listen_port, agent_port_override, local_skill_ports
 
 
@@ -45,6 +46,46 @@ class BufferedGatewayChatClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final.model, "gpt-latest")
         self.assertEqual(final.usage_details["input_token_count"], 10)
         self.assertEqual(final.usage_details["output_token_count"], 2)
+
+
+class ToolReadinessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_connected_source_without_tools_is_not_ready(self):
+        tool = MagicMock(name="empty tool")
+        tool.name = "empty"
+        tool.url = "http://127.0.0.1:1"
+        tool.functions = []
+        tool.connect = AsyncMock()
+        tool.load_tools = AsyncMock()
+        tool.close = AsyncMock()
+
+        self.assertFalse(await _diagnose_mcp_tools([tool]))
+        tool.close.assert_awaited_once()
+
+    async def test_duplicate_names_across_sources_are_not_ready(self):
+        tools = []
+        for name in ("first", "second"):
+            tool = MagicMock()
+            tool.name = name
+            tool.url = None
+            tool.functions = [SimpleNamespace(name="shared_tool")]
+            tool.connect = AsyncMock()
+            tool.load_tools = AsyncMock()
+            tool.close = AsyncMock()
+            tools.append(tool)
+
+        self.assertFalse(await _diagnose_mcp_tools(tools))
+        for tool in tools:
+            tool.close.assert_awaited_once()
+
+
+class AgentStartupTests(unittest.TestCase):
+    @patch("main._gateway_client")
+    @patch("main._diagnose_mcp_tools", new_callable=AsyncMock, return_value=False)
+    @patch("main._resolve_tools", return_value=[object()])
+    def test_agent_refuses_to_start_without_usable_tools(self, _resolve, _diagnose, gateway):
+        with self.assertRaisesRegex(RuntimeError, "MCP tool sources failed"):
+            build_agent()
+        gateway.assert_not_called()
 
 
 class LocalPortTests(unittest.TestCase):

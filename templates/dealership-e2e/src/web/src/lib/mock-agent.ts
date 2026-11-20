@@ -39,19 +39,10 @@ function hasAny(input: string, terms: string[]): boolean {
 export function buildMockScenario(input: {
   latestMessage: string;
   email?: string;
-  command?: "apply";
   stage?: DealStage;
 }): MockScenario {
   const lower = input.latestMessage.toLowerCase();
   const extractedEmail = input.email ?? input.latestMessage.match(EMAIL_REGEX)?.[0];
-
-  if (input.command === "apply") {
-    return {
-      assistantReply:
-        "Application submitted. I sent the package to Contoso Motors for Teams approval. I'll keep this panel updated.",
-      stage: "pending_teams_approval"
-    };
-  }
 
   if (hasAny(lower, ["compare", "comparison", "side by side"])) {
     return {
@@ -70,14 +61,14 @@ export function buildMockScenario(input: {
   if (hasAny(lower, ["payment", "monthly", "finance", "apr"])) {
     return {
       assistantReply:
-        "Using sandboxed pre-qualification logic (PII-safe), an estimated payment is $589/month for 72 months at up to 6.4% APR, with $2,500 down.",
+        "Demo estimate only: $589/month for 72 months at up to 6.4% APR, with $2,500 down. No sandbox calculation was run.",
       stage: input.stage ?? "shortlisted"
     };
   }
 
   if (extractedEmail) {
     return {
-      assistantReply: `Perfect — I saved ${extractedEmail}. When you're ready, tap Apply to start the approval workflow.`,
+      assistantReply: "Email noted for this demo. Application submission is not connected.",
       stage: input.stage ?? "shortlisted"
     };
   }
@@ -103,7 +94,7 @@ export function buildMockScenario(input: {
 
   return {
     assistantReply:
-      "I can help with search, monthly payment estimates, and submitting an application. Try: “EV under $38k, 250+ miles, room for a car seat.”",
+      "I can help with sample vehicle searches and payment estimates. Application submission is not connected. Try: “EV under $38k, 250+ miles, room for a car seat.”",
     stage: input.stage ?? "idle"
   };
 }

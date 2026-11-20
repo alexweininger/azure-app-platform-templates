@@ -1151,7 +1151,7 @@ def _tool_process_environment() -> dict[str, str]:
         "PYTHONIOENCODING": "utf-8",
         "PYTHONUTF8": "1",
     }
-    for optional_name in ("LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"):
+    for optional_name in ("LANG", "LC_ALL", "SYSTEMROOT", "WINDIR", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"):
         if os.environ.get(optional_name):
             environment[optional_name] = os.environ[optional_name]
     return environment
