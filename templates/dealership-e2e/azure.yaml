@@ -26,8 +26,7 @@ services:
     kind: hosted
     docker:
       remoteBuild: true
-    config:
-      startupCommand: python main.py
+    startupCommand: python main.py
 
   # Each child of src/skills is expected to become an independently named
   # Function App when the vertical implementation lands.
