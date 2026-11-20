@@ -13,55 +13,94 @@ $env:AGENT_PORT = "$AgentPort"
 $env:WEB_PORT = "$WebPort"
 $env:AGENT_URL = "http://127.0.0.1:$AgentPort"
 & (Join-Path $PSScriptRoot "dev-stop.ps1") | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "The previous app processes could not be stopped safely." }
 New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
-Remove-Item Env:UV_FROZEN, Env:UV_LOCKED, Env:UV_OFFLINE, Env:UV_NO_SYNC, Env:UV_EXTRA_INDEX_URL -ErrorAction SilentlyContinue
-$env:UV_INDEX_URL = if ($env:UV_INDEX_URL) { $env:UV_INDEX_URL } else { "https://pypi.org/simple/" }
-$env:UV_DEFAULT_INDEX = $env:UV_INDEX_URL
-$env:PIP_INDEX_URL = if ($env:PIP_INDEX_URL) { $env:PIP_INDEX_URL } else { $env:UV_INDEX_URL }
+$IndexUrl = if ($env:PIP_INDEX_URL) { $env:PIP_INDEX_URL } elseif ($env:UV_INDEX_URL) { $env:UV_INDEX_URL } else { $env:UV_DEFAULT_INDEX }
+if ($IndexUrl) { $env:PIP_INDEX_URL = $env:UV_INDEX_URL = $env:UV_DEFAULT_INDEX = $IndexUrl }
 
-function Wait-Port($Name, $Port, $Process) {
+function Wait-Health($Name, $Port, $Route, $Process) {
+  $lastError = "No HTTP response."
   for ($i = 0; $i -lt 200; $i++) {
-    if ($Process.HasExited) { throw "$Name exited before opening port $Port" }
-    if (Test-NetConnection 127.0.0.1 -Port $Port -InformationLevel Quiet -WarningAction SilentlyContinue) {
-      Write-Host "[$Name] READY on port $Port"
-      return
+    if ($Process.HasExited) { throw "$Name exited before becoming ready. See .dev-run/$Name.err.log." }
+    try {
+      $response = Invoke-WebRequest "http://127.0.0.1:$Port$Route" -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 2
+      if ($response.StatusCode -eq 200) {
+        Write-Host "[$Name] READY on port $Port"
+        return
+      }
+      $lastError = "HTTP $($response.StatusCode)"
+    } catch {
+      $lastError = $_.Exception.Message
     }
     Start-Sleep -Milliseconds 150
   }
-  throw "$Name timed out opening port $Port"
+  throw "$Name did not become ready on port $Port`: $lastError. See .dev-run/$Name.err.log."
 }
 
 $processes = @()
+function Save-ProcessState {
+  if ($script:processes.Count -eq 0) { Set-Content (Join-Path $RunDir "processes.json") "[]" }
+  else { @($script:processes) | ConvertTo-Json | Set-Content (Join-Path $RunDir "processes.json") }
+}
+function Register-TrackedProcess($Name, $Port, $Process) {
+  $record = @{ name = $Name; port = $Port; pid = $Process.Id; startedAt = $null }
+  $script:processes += $record
+  Save-ProcessState
+  try { $record.startedAt = $Process.StartTime.ToUniversalTime().ToString("O") }
+  catch { throw "Could not record process identity for $Name. Verify PID $($Process.Id) manually." }
+  Save-ProcessState
+}
 try {
   if (-not (Get-Command uv -ErrorAction SilentlyContinue)) { throw "uv is required." }
   $SkillDir = Join-Path $Root "src/skills/__SKILL_NAME__"
-  if (-not $SkipSkill -and (Test-Path $SkillDir) -and (Get-Command uv -ErrorAction SilentlyContinue) -and (Get-Command func -ErrorAction SilentlyContinue)) {
+  if (-not $SkipSkill -and (Test-Path $SkillDir)) {
+    $func = if (Get-Command func.cmd -ErrorAction SilentlyContinue) { "func.cmd" }
+      elseif (Get-Command func -ErrorAction SilentlyContinue) { "func" }
+      else { throw "Azure Functions Core Tools is required for the starter skill. Install it or run with -SkipSkill." }
     if ($ForceClean -and (Test-Path (Join-Path $SkillDir ".venv"))) {
       Remove-Item -Recurse -Force (Join-Path $SkillDir ".venv")
     }
     $skillArgs = if (Test-Path (Join-Path $SkillDir "pyproject.toml")) {
-      @("run", "func", "start", "--port", "$SkillPort")
+      @("run", $func, "start", "--port", "$SkillPort")
     } else {
-      @("run", "--with-requirements", "requirements.txt", "func", "start", "--port", "$SkillPort")
+      @("run", "--with-requirements", "requirements.txt", $func, "start", "--port", "$SkillPort")
     }
-    $skill = Start-Process uv -ArgumentList $skillArgs -WorkingDirectory $SkillDir -WindowStyle Hidden -PassThru
-    $processes += @{ name = "skill"; port = $SkillPort; pid = $skill.Id }
-    Wait-Port "skill" $SkillPort $skill
+    $previousWorkerRuntime = [Environment]::GetEnvironmentVariable("FUNCTIONS_WORKER_RUNTIME", "Process")
+    $previousTemp = [Environment]::GetEnvironmentVariable("TEMP", "Process")
+    $previousTmp = [Environment]::GetEnvironmentVariable("TMP", "Process")
+    $skillTemp = Join-Path $Root ".dev-temp/__SKILL_NAME__"
+    New-Item -ItemType Directory -Force -Path $skillTemp | Out-Null
+    try {
+      if (-not (Test-Path (Join-Path $SkillDir "local.settings.json")) -and -not $previousWorkerRuntime) {
+        $env:FUNCTIONS_WORKER_RUNTIME = "python"
+      }
+      $env:TEMP = $skillTemp
+      $env:TMP = $skillTemp
+      $skill = Start-Process uv -ArgumentList $skillArgs -WorkingDirectory $SkillDir -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput (Join-Path $RunDir "skill.log") -RedirectStandardError (Join-Path $RunDir "skill.err.log")
+    } finally {
+      [Environment]::SetEnvironmentVariable("FUNCTIONS_WORKER_RUNTIME", $previousWorkerRuntime, "Process")
+      [Environment]::SetEnvironmentVariable("TEMP", $previousTemp, "Process")
+      [Environment]::SetEnvironmentVariable("TMP", $previousTmp, "Process")
+    }
+    Register-TrackedProcess "skill" $SkillPort $skill
+    Wait-Health "skill" $SkillPort "/api/health" $skill
   }
   $AgentDir = Join-Path $Root "src/agent"
   if ($ForceClean -and (Test-Path (Join-Path $AgentDir ".venv"))) {
     Remove-Item -Recurse -Force (Join-Path $AgentDir ".venv")
   }
-  $agent = Start-Process uv -ArgumentList "run", "main.py" -WorkingDirectory $AgentDir -WindowStyle Hidden -PassThru
-  $processes += @{ name = "agent"; port = $AgentPort; pid = $agent.Id }
-  Wait-Port "agent" $AgentPort $agent
-  $web = Start-Process npm.cmd -ArgumentList "run", "dev" -WorkingDirectory (Join-Path $Root "src/web") -WindowStyle Hidden -PassThru
-  $processes += @{ name = "web"; port = $WebPort; pid = $web.Id }
-  Wait-Port "web" $WebPort $web
-  $processes | ConvertTo-Json | Set-Content (Join-Path $RunDir "processes.json")
+  $agent = Start-Process uv -ArgumentList "run", "main.py" -WorkingDirectory $AgentDir -WindowStyle Hidden -PassThru `
+    -RedirectStandardOutput (Join-Path $RunDir "agent.log") -RedirectStandardError (Join-Path $RunDir "agent.err.log")
+  Register-TrackedProcess "agent" $AgentPort $agent
+  Wait-Health "agent" $AgentPort "/health" $agent
+  $web = Start-Process npm.cmd -ArgumentList "run", "dev" -WorkingDirectory (Join-Path $Root "src/web") -WindowStyle Hidden -PassThru `
+    -RedirectStandardOutput (Join-Path $RunDir "web.log") -RedirectStandardError (Join-Path $RunDir "web.err.log")
+  Register-TrackedProcess "web" $WebPort $web
+  Wait-Health "web" $WebPort "/" $web
   Write-Host "__APP_NAME__ started: web http://localhost:$WebPort, agent http://localhost:$AgentPort"
 } catch {
-  $processes | ConvertTo-Json | Set-Content (Join-Path $RunDir "processes.json")
+  Save-ProcessState
   & (Join-Path $PSScriptRoot "dev-stop.ps1")
   throw
 }

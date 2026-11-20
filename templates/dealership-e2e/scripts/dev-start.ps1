@@ -8,9 +8,8 @@
     Each Hosted Skill is a normal uv project with its own pyproject.toml.
     Startup follows the README pattern exactly: run `uv run func start` from
     inside each skill folder and let uv create/sync `.venv` automatically.
-    On Microsoft corp networks, the script defaults uv to the documented
-    internal package mirror unless UV_DEFAULT_INDEX or UV_INDEX_URL is already
-    set. It also creates each missing local.settings.json from its example,
+    The script respects the configured Python package index. It also creates
+    each missing local.settings.json from its example,
     filling in the AI Gateway endpoint/key from src/agent/.env.
 
     Start order matters: skills first (so the agent's own startup diagnostics
@@ -121,6 +120,7 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
 if (-not $KeepExisting) {
     Write-Host "[setup] stopping this workspace's tracked processes so startup order is deterministic..." -ForegroundColor DarkCyan
     & (Join-Path $DealerScriptRoot 'dev-stop.ps1')
+    if ($LASTEXITCODE -ne 0) { throw 'The previous app processes could not be stopped safely.' }
     # taskkill is asynchronous with respect to child handle cleanup. Give
     # Node/Functions workers a moment to release ports and log handles before
     # recreating the stack.
@@ -135,37 +135,19 @@ $Skills = [ordered]@{
     'deal-doc'         = $DealDocPort
 }
 
-# Automate src/README.md "Corporate network / proxy note" exactly:
-# 1. respect an explicit uv index;
-# 2. otherwise inherit pip's configured index, if it has one;
-# 3. otherwise use Microsoft's package feed proxy.
-# Public files.pythonhosted.org is blocked by the Microsoft corporate proxy.
-if (-not $env:UV_DEFAULT_INDEX -and -not $env:UV_INDEX_URL) {
-    $indexUrl = $env:PIP_INDEX_URL
-    if (-not $indexUrl) {
-        $indexUrl = (& python -m pip config get global.index-url 2>$null)
-        if ($LASTEXITCODE -ne 0) {
-            $indexUrl = $null
-        }
-    }
-    if (-not $indexUrl) {
-        $indexUrl = 'https://pypi.org/simple/'
-    }
-    $env:UV_INDEX_URL = $indexUrl
-    $env:UV_DEFAULT_INDEX = $indexUrl
-    Write-Host "[setup] uv index not set; using the README-resolved package index." -ForegroundColor DarkCyan
-} else {
-    Write-Host "[setup] using the caller-configured uv package index." -ForegroundColor DarkCyan
+$indexUrl = if ($env:PIP_INDEX_URL) { $env:PIP_INDEX_URL } elseif ($env:UV_INDEX_URL) { $env:UV_INDEX_URL } else { $env:UV_DEFAULT_INDEX }
+if (-not $indexUrl -and (Get-Command python -ErrorAction SilentlyContinue)) {
+    $configuredIndex = & python -m pip config get global.index-url 2>$null
+    if ($LASTEXITCODE -eq 0) { $indexUrl = $configuredIndex }
 }
+if ($indexUrl) { $env:PIP_INDEX_URL = $env:UV_INDEX_URL = $env:UV_DEFAULT_INDEX = $indexUrl }
 
 # Existing state (if any) from a prior run this script didn't clean up.
 $existing = @()
 if (Test-Path $StateFile) {
     try {
         $existing = @(Get-Content $StateFile -Raw | ConvertFrom-Json)
-    } catch {
-        $existing = @()
-    }
+    } catch { throw "Could not read the process registry. No process was signaled; repair or remove $StateFile manually." }
 }
 
 $processes = New-Object System.Collections.Generic.List[object]
@@ -185,12 +167,9 @@ function Test-TrackedProcess {
     if (-not $process) {
         return $false
     }
-    if ($Entry.startedAt) {
-        $actual = $process.StartTime.ToUniversalTime().ToString('O')
-        if ($actual -ne $Entry.startedAt) {
-            return $false
-        }
-    }
+    if (-not $Entry.startedAt) { throw "PID $($Entry.pid) has no recorded start identity. Verify it manually before continuing." }
+    $actual = $process.StartTime.ToUniversalTime()
+    if ($actual -ne ([datetime]$Entry.startedAt).ToUniversalTime()) { return $false }
     return $true
 }
 
@@ -362,9 +341,9 @@ if (-not $SkipSkills) {
     Add-TrackedAlias -Name 'azurite-queue' -Port $AzuriteQueuePort -Source $azuriteProcess
     Add-TrackedAlias -Name 'azurite-table' -Port $AzuriteTablePort -Source $azuriteProcess
     if (
-        -not (Wait-PortListening -Name 'azurite' -Port $AzuriteBlobPort -TimeoutSeconds 30) -or
-        -not (Wait-PortListening -Name 'azurite-queue' -Port $AzuriteQueuePort -TimeoutSeconds 30) -or
-        -not (Wait-PortListening -Name 'azurite-table' -Port $AzuriteTablePort -TimeoutSeconds 30)
+        -not (Wait-PortListening -Name 'azurite' -Port $AzuriteBlobPort -TimeoutSeconds 120) -or
+        -not (Wait-PortListening -Name 'azurite-queue' -Port $AzuriteQueuePort -TimeoutSeconds 120) -or
+        -not (Wait-PortListening -Name 'azurite-table' -Port $AzuriteTablePort -TimeoutSeconds 120)
     ) {
         & (Join-Path $DealerScriptRoot 'dev-stop.ps1')
         throw "Azurite failed to start. The Hosted Skills, agent, and web app were not started."
@@ -441,22 +420,42 @@ if (-not $SkipSkills) {
         }
 
         # Run from the skill directory and let its pyproject.toml drive venv
-        # creation and dependency sync. `func` is resolved from the inherited
-        # PATH while uv exposes the skill's environment to the Functions host.
-        $null = Start-Tracked -Name $name -WorkingDirectory $skillDir -FilePath 'uv' `
-            -ArgumentList @('run', 'func', 'start', '--port', "$port") -Port $port
-    }
-
-    $skillsReady = $true
-    foreach ($name in $Skills.Keys) {
-        if (-not (Wait-PortListening -Name $name -Port $Skills[$name])) {
-            $skillsReady = $false
+        # creation and dependency sync. On Windows, uv must be given the npm
+        # command shim explicitly; it does not resolve `func` to `func.cmd`.
+        $funcCommand = if ($env:OS -eq 'Windows_NT') { 'func.cmd' } else { 'func' }
+        $originalTemp = $env:TEMP
+        $originalTmp = $env:TMP
+        for ($attempt = 1; $attempt -le 2; $attempt++) {
+            try {
+                if ($env:OS -eq 'Windows_NT') {
+                    # Core Tools stores local host secrets under the temp directory.
+                    $skillTemp = Join-Path $RepoRoot ".dev-temp\$name"
+                    New-Item -ItemType Directory -Force -Path $skillTemp | Out-Null
+                    $env:TEMP = $skillTemp
+                    $env:TMP = $skillTemp
+                }
+                $skillProcess = Start-Tracked -Name $name -WorkingDirectory $skillDir -FilePath 'uv' `
+                    -ArgumentList @('run', $funcCommand, 'start', '--port', "$port") -Port $port
+            } finally {
+                $env:TEMP = $originalTemp
+                $env:TMP = $originalTmp
+            }
+            if (Wait-PortListening -Name $name -Port $port) {
+                break
+            }
+            if (
+                $attempt -eq 1 -and -not (Test-TrackedProcess -Entry $skillProcess) -and
+                (Select-String -LiteralPath $skillProcess.errlog -SimpleMatch "Value cannot be null. (Parameter 'provider')" -Quiet)
+            ) {
+                $null = $processes.Remove($skillProcess)
+                Save-ProcessState
+                Write-Warning "[$name] Azure Functions Core Tools reported a startup provider error. Retrying once."
+                continue
+            }
+            Save-ProcessState
+            & (Join-Path $DealerScriptRoot 'dev-stop.ps1')
+            throw "[$name] failed to start. The agent and web app were not started; see the log tails above."
         }
-    }
-    if (-not $skillsReady) {
-        Save-ProcessState
-        & (Join-Path $DealerScriptRoot 'dev-stop.ps1')
-        throw "One or more Hosted Skills failed to start. The agent and web app were not started; see the log tails above."
     }
 }
 
@@ -469,23 +468,25 @@ if (-not $SkipAgent) {
         & (Join-Path $DealerScriptRoot 'dev-stop.ps1')
         throw "src/agent/.env is missing. New git worktrees do not inherit gitignored Azure state or environment files. Copy .azure and the .env/local.settings.json files from an already-provisioned sibling worktree, or run 'azd provision' in infra-ai-gateway for this worktree."
     } else {
-        $otelVariables = @(
+        $agentEnvironmentVariables = @(
             'OTEL_EXPORTER_OTLP_ENDPOINT',
             'OTEL_EXPORTER_OTLP_PROTOCOL',
             'OTEL_EXPORTER_OTLP_TRACES_PROTOCOL',
-            'OTEL_EXPORTER_OTLP_METRICS_PROTOCOL'
+            'OTEL_EXPORTER_OTLP_METRICS_PROTOCOL',
+            'PYTHONIOENCODING'
         )
-        $otelValues = @{}
-        foreach ($variable in $otelVariables) {
-            $otelValues[$variable] = [Environment]::GetEnvironmentVariable($variable, 'Process')
+        $agentEnvironmentValues = @{}
+        foreach ($variable in $agentEnvironmentVariables) {
+            $agentEnvironmentValues[$variable] = [Environment]::GetEnvironmentVariable($variable, 'Process')
             [Environment]::SetEnvironmentVariable($variable, $null, 'Process')
         }
+        [Environment]::SetEnvironmentVariable('PYTHONIOENCODING', 'utf-8:backslashreplace', 'Process')
         try {
             $null = Start-Tracked -Name 'agent' -WorkingDirectory $agentDir -FilePath 'uv' `
                 -ArgumentList @('run', 'main.py') -Port $AgentPort
         } finally {
-            foreach ($variable in $otelVariables) {
-                [Environment]::SetEnvironmentVariable($variable, $otelValues[$variable], 'Process')
+            foreach ($variable in $agentEnvironmentVariables) {
+                [Environment]::SetEnvironmentVariable($variable, $agentEnvironmentValues[$variable], 'Process')
             }
         }
         if (-not (Wait-PortListening -Name 'agent' -Port $AgentPort)) {
@@ -511,7 +512,11 @@ if (-not $SkipWeb) {
             }
         }
     }
-    if (-not (Test-Path (Join-Path $webDir 'node_modules\next')) -or $ForceClean) {
+    if (
+        -not (Test-Path (Join-Path $webDir 'node_modules\.bin\next.cmd')) -or
+        -not (Test-Path (Join-Path $webDir 'node_modules\next\dist\bin\next')) -or
+        $ForceClean
+    ) {
         Write-Host "[web] installing/syncing npm dependencies..." -ForegroundColor DarkCyan
         Push-Location $webDir
         try {

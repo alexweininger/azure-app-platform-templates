@@ -1,6 +1,7 @@
 .azure/
 .azure-app-platform/
 .dev-run/
+.dev-temp/
 .venv/
 node_modules/
 __pycache__/

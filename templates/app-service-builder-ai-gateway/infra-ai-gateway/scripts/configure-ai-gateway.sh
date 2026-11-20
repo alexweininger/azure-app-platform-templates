@@ -2,10 +2,10 @@
 set -euo pipefail
 umask 077
 
-unset UV_FROZEN UV_LOCKED UV_OFFLINE UV_NO_SYNC UV_EXTRA_INDEX_URL
-export UV_INDEX_URL="${UV_INDEX_URL:-https://pypi.org/simple/}"
-export UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX:-$UV_INDEX_URL}"
-export PIP_INDEX_URL="${PIP_INDEX_URL:-$UV_INDEX_URL}"
+index_url="${PIP_INDEX_URL:-${UV_INDEX_URL:-${UV_DEFAULT_INDEX:-}}}"
+if [[ -n "$index_url" ]]; then
+  export PIP_INDEX_URL="$index_url" UV_INDEX_URL="$index_url" UV_DEFAULT_INDEX="$index_url"
+fi
 
 AI_GATEWAY_API_VERSION="2025-09-01-preview"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

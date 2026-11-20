@@ -31,10 +31,8 @@ foreach ($Argument in @($RuntimeArguments)) {
   }
 }
 
-Remove-Item Env:UV_FROZEN, Env:UV_LOCKED, Env:UV_OFFLINE, Env:UV_NO_SYNC, Env:UV_EXTRA_INDEX_URL -ErrorAction SilentlyContinue
-$env:UV_INDEX_URL = if ($env:UV_INDEX_URL) { $env:UV_INDEX_URL } else { "https://pypi.org/simple/" }
-$env:UV_DEFAULT_INDEX = $env:UV_INDEX_URL
-$env:PIP_INDEX_URL = if ($env:PIP_INDEX_URL) { $env:PIP_INDEX_URL } else { $env:UV_INDEX_URL }
+$IndexUrl = if ($env:PIP_INDEX_URL) { $env:PIP_INDEX_URL } elseif ($env:UV_INDEX_URL) { $env:UV_INDEX_URL } else { $env:UV_DEFAULT_INDEX }
+if ($IndexUrl) { $env:PIP_INDEX_URL = $env:UV_INDEX_URL = $env:UV_DEFAULT_INDEX = $IndexUrl }
 $SelectedRuntimeArguments = if ($AgentRuntime) { @("--agent-runtime=$AgentRuntime") } else { @() }
 if (-not (Get-Command uv -ErrorAction SilentlyContinue)) { throw "uv is required." }
 Push-Location (Join-Path $Root "src/agent")
@@ -42,10 +40,8 @@ try {
   if ($ForceClean -and (Test-Path ".venv")) {
     Remove-Item -Recurse -Force ".venv"
   }
-  if (-not (Test-Path ".venv") -or $ForceClean) {
-    & uv sync
-    if ($LASTEXITCODE -ne 0) { throw "Dependency sync failed; see the error above." }
-  }
+  & uv sync
+  if ($LASTEXITCODE -ne 0) { throw "Dependency sync failed; see the error above." }
   $env:UV_NO_SYNC = "1"
   & uv run main.py @SelectedRuntimeArguments --check-runtime
   if ($LASTEXITCODE -ne 0) { throw "Runtime configuration failed; see the error above." }

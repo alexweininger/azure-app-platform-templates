@@ -6,10 +6,8 @@ param()
 
 $ErrorActionPreference = 'Stop'
 
-Remove-Item Env:UV_FROZEN, Env:UV_LOCKED, Env:UV_OFFLINE, Env:UV_NO_SYNC, Env:UV_EXTRA_INDEX_URL -ErrorAction SilentlyContinue
-$env:UV_INDEX_URL = if ($env:UV_INDEX_URL) { $env:UV_INDEX_URL } else { 'https://pypi.org/simple/' }
-$env:UV_DEFAULT_INDEX = $env:UV_INDEX_URL
-$env:PIP_INDEX_URL = if ($env:PIP_INDEX_URL) { $env:PIP_INDEX_URL } else { $env:UV_INDEX_URL }
+$IndexUrl = if ($env:PIP_INDEX_URL) { $env:PIP_INDEX_URL } elseif ($env:UV_INDEX_URL) { $env:UV_INDEX_URL } else { $env:UV_DEFAULT_INDEX }
+if ($IndexUrl) { $env:PIP_INDEX_URL = $env:UV_INDEX_URL = $env:UV_DEFAULT_INDEX = $IndexUrl }
 
 $AiGatewayApiVersion = '2025-09-01-preview'
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path

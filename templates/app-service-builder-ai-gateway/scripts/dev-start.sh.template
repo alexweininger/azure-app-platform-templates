@@ -34,14 +34,27 @@ while (($#)); do
   shift
 done
 
-"$ROOT/scripts/dev-stop.sh" >/dev/null 2>&1 || true
+if ! "$ROOT/scripts/dev-stop.sh"; then
+  echo "The previous app processes could not be stopped safely." >&2
+  exit 1
+fi
 mkdir -p "$RUN_DIR"
 : >"$RUN_DIR/processes.posix.tsv"
 
-unset UV_FROZEN UV_LOCKED UV_OFFLINE UV_NO_SYNC UV_EXTRA_INDEX_URL
-export UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX:-${UV_INDEX_URL:-https://pypi.org/simple/}}"
-export UV_INDEX_URL="$UV_DEFAULT_INDEX"
-export PIP_INDEX_URL="${PIP_INDEX_URL:-$UV_INDEX_URL}"
+record_process() {
+  local name="$1" port="$2" pid="$3" started_at
+  started_at="$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')" || started_at=""
+  printf '%s\t%s\t%s\t%s\n' "$name" "$port" "$pid" "$started_at" >>"$RUN_DIR/processes.posix.tsv"
+  if [[ -z "$started_at" ]]; then
+    echo "Could not record process identity for $name. Verify PID $pid manually." >&2
+    return 1
+  fi
+}
+
+index_url="${PIP_INDEX_URL:-${UV_INDEX_URL:-${UV_DEFAULT_INDEX:-}}}"
+if [[ -n "$index_url" ]]; then
+  export PIP_INDEX_URL="$index_url" UV_INDEX_URL="$index_url" UV_DEFAULT_INDEX="$index_url"
+fi
 
 if [ -f "$ROOT/.env" ]; then
   set -a
@@ -60,7 +73,7 @@ if [ -d "$ROOT/src/skills" ] && command -v func >/dev/null 2>&1; then
     azurite --silent --inMemoryPersistence --skipApiVersionCheck --disableTelemetry \
       >"$RUN_DIR/azurite.log" 2>&1 &
     azurite_pid=$!
-    printf "azurite\t10000\t%s\n" "$azurite_pid" >>"$RUN_DIR/processes.posix.tsv"
+    record_process "azurite" "10000" "$azurite_pid"
   fi
   skill_port="$SKILL_PORT"
   for skill_dir in "$ROOT"/src/skills/*; do
@@ -74,7 +87,7 @@ if [ -d "$ROOT/src/skills" ] && command -v func >/dev/null 2>&1; then
         uv run func start --port "$skill_port" >"$RUN_DIR/$skill_name.log" 2>&1
       ) &
       skill_pid=$!
-      printf "%s\t%s\t%s\n" "$skill_name" "$skill_port" "$skill_pid" >>"$RUN_DIR/processes.posix.tsv"
+      record_process "$skill_name" "$skill_port" "$skill_pid"
       skill_port=$((skill_port + 1))
     fi
   done
@@ -84,8 +97,9 @@ if [ -f "$ROOT/src/agent/main.py" ]; then
   if [[ "$FORCE_CLEAN" == "1" && -d "$ROOT/src/agent/.venv" ]]; then
     rm -rf "$ROOT/src/agent/.venv"
   fi
-  if [[ ! -d "$ROOT/src/agent/.venv" || "$FORCE_CLEAN" == "1" ]]; then
-    (cd "$ROOT/src/agent" && uv sync)
+  if ! (cd "$ROOT/src/agent" && uv sync); then
+    "$ROOT/scripts/dev-stop.sh" || echo "Process cleanup is incomplete." >&2
+    exit 1
   fi
   echo "Starting backend agent on http://127.0.0.1:$AGENT_PORT ..."
   (
@@ -93,27 +107,36 @@ if [ -f "$ROOT/src/agent/main.py" ]; then
     UV_NO_SYNC=1 PORT="$AGENT_PORT" AGENT_PORT="$AGENT_PORT" uv run main.py >"$RUN_DIR/agent.log" 2>&1
   ) &
   agent_pid=$!
-  printf "agent\t%s\t%s\n" "$AGENT_PORT" "$agent_pid" >>"$RUN_DIR/processes.posix.tsv"
+  record_process "agent" "$AGENT_PORT" "$agent_pid"
+  agent_ready=0
   for _ in $(seq 1 120); do
     if ! kill -0 "$agent_pid" 2>/dev/null; then
       echo "Backend agent exited before becoming ready on port $AGENT_PORT. Recent log output:" >&2
       tail -n 40 "$RUN_DIR/agent.log" >&2 || true
-      "$ROOT/scripts/dev-stop.sh" >/dev/null 2>&1 || true
+      "$ROOT/scripts/dev-stop.sh" || echo "Process cleanup is incomplete." >&2
       exit 1
     fi
     if curl -fsS "http://127.0.0.1:$AGENT_PORT/healthz" >/dev/null 2>&1 || curl -fsS "http://127.0.0.1:$AGENT_PORT/api/runtime" >/dev/null 2>&1; then
       echo "Backend agent ready on http://127.0.0.1:$AGENT_PORT"
+      agent_ready=1
       break
     fi
     sleep 0.15
   done
+  if [[ "$agent_ready" != "1" ]]; then
+    echo "Backend agent did not become ready on port $AGENT_PORT. Recent log output:" >&2
+    tail -n 40 "$RUN_DIR/agent.log" >&2 || true
+    "$ROOT/scripts/dev-stop.sh" || echo "Process cleanup is incomplete." >&2
+    exit 1
+  fi
 fi
 
 if [[ "$FORCE_CLEAN" == "1" && -d "$ROOT/.venv" ]]; then
   rm -rf "$ROOT/.venv"
 fi
-if [[ ! -d "$ROOT/.venv" || "$FORCE_CLEAN" == "1" ]]; then
-  (cd "$ROOT" && uv sync)
+if ! (cd "$ROOT" && uv sync); then
+  "$ROOT/scripts/dev-stop.sh" || echo "Process cleanup is incomplete." >&2
+  exit 1
 fi
 echo "Starting __APP_NAME__ (App Service Builder + AI Gateway) on http://127.0.0.1:$WEB_PORT ..."
 (
@@ -121,13 +144,13 @@ echo "Starting __APP_NAME__ (App Service Builder + AI Gateway) on http://127.0.0
   UV_NO_SYNC=1 uv run python -m uvicorn app:create_app --factory --host 127.0.0.1 --port "$WEB_PORT" --no-access-log --log-level warning >"$RUN_DIR/web.log" 2>&1
 ) &
 web_pid=$!
-printf "web\t%s\t%s\n" "$WEB_PORT" "$web_pid" >>"$RUN_DIR/processes.posix.tsv"
+record_process "web" "$WEB_PORT" "$web_pid"
 
 for _ in $(seq 1 120); do
   if ! kill -0 "$web_pid" 2>/dev/null; then
     echo "App Service Builder AI Gateway app exited before becoming ready on port $WEB_PORT. Recent log output:" >&2
     tail -n 40 "$RUN_DIR/web.log" >&2 || true
-    "$ROOT/scripts/dev-stop.sh" >/dev/null 2>&1 || true
+    "$ROOT/scripts/dev-stop.sh" || echo "Process cleanup is incomplete." >&2
     exit 1
   fi
   if curl -fsS "http://127.0.0.1:$WEB_PORT/health" >/dev/null 2>&1 || curl -fsS "http://127.0.0.1:$WEB_PORT" >/dev/null 2>&1; then
@@ -139,5 +162,5 @@ done
 
 echo "App Service Builder AI Gateway app did not become ready on port $WEB_PORT. Recent log output:" >&2
 tail -n 40 "$RUN_DIR/web.log" >&2 || true
-"$ROOT/scripts/dev-stop.sh" >/dev/null 2>&1 || true
+"$ROOT/scripts/dev-stop.sh" || echo "Process cleanup is incomplete." >&2
 exit 1

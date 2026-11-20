@@ -84,8 +84,15 @@ kill_tree() {
 failures=0
 stopped_any=0
 stopped_pids=" "
+if [[ ! -f "$STATE_FILE" ]]; then
+  echo "__APP_NAME__ was not running."
+  exit 0
+fi
 trap 'rm -f "$NEXT_STATE"' EXIT
-: >"$NEXT_STATE"
+if ! : >"$NEXT_STATE"; then
+  echo "Could not write the process registry. No process was signaled." >&2
+  exit 1
+fi
 
 if [[ -f "$STATE_FILE" ]]; then
   while IFS=$'\t' read -r name port pid started_at; do
@@ -141,7 +148,10 @@ if ((failures)); then
   exit 1
 fi
 
-rm -rf "$RUN_DIR"
+if ! rm -f "$STATE_FILE" "$NEXT_STATE"; then
+  echo "Could not remove the process registry." >&2
+  exit 1
+fi
 trap - EXIT
 if ((stopped_any)); then
   echo "__APP_NAME__ stopped."

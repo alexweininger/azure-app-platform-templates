@@ -48,19 +48,17 @@ done
 set --
 if [[ -n "$RUNTIME_ARG" ]]; then set -- "$RUNTIME_ARG"; fi
 
-unset UV_FROZEN UV_LOCKED UV_OFFLINE UV_NO_SYNC UV_EXTRA_INDEX_URL
-export UV_INDEX_URL="${UV_INDEX_URL:-https://pypi.org/simple/}"
-export UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX:-$UV_INDEX_URL}"
-export PIP_INDEX_URL="${PIP_INDEX_URL:-$UV_INDEX_URL}"
+index_url="${PIP_INDEX_URL:-${UV_INDEX_URL:-${UV_DEFAULT_INDEX:-}}}"
+if [[ -n "$index_url" ]]; then
+  export PIP_INDEX_URL="$index_url" UV_INDEX_URL="$index_url" UV_DEFAULT_INDEX="$index_url"
+fi
 
 command -v uv >/dev/null || { echo "uv is required." >&2; exit 1; }
 command -v curl >/dev/null || { echo "curl is required for HTTP readiness." >&2; exit 1; }
 if [[ "$FORCE_CLEAN" == "1" && -d "$ROOT/src/agent/.venv" ]]; then
   rm -rf "$ROOT/src/agent/.venv"
 fi
-if [[ ! -d "$ROOT/src/agent/.venv" || "$FORCE_CLEAN" == "1" ]]; then
-  (cd "$ROOT/src/agent" && uv sync)
-fi
+(cd "$ROOT/src/agent" && uv sync)
 export UV_NO_SYNC=1
 (cd "$ROOT/src/agent" && uv run main.py "$@" --check-runtime)
 if ! "$ROOT/scripts/dev-stop.sh"; then

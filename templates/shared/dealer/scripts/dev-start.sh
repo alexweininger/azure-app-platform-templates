@@ -114,20 +114,12 @@ command -v uv >/dev/null || {
   exit 1
 }
 
-# Automate src/README.md "Corporate network / proxy note" exactly.
-if [[ -z "${UV_DEFAULT_INDEX:-}" && -z "${UV_INDEX_URL:-}" ]]; then
-  index_url="${PIP_INDEX_URL:-}"
-  if [[ -z "$index_url" ]] && command -v pip3 >/dev/null; then
-    index_url="$(pip3 config get global.index-url 2>/dev/null || true)"
-  fi
-  if [[ -z "$index_url" ]]; then
-    index_url="https://pypi.org/simple/"
-  fi
-  export UV_INDEX_URL="$index_url"
-  export UV_DEFAULT_INDEX="$index_url"
-  echo "[setup] uv index not set; using the README-resolved package index."
-else
-  echo "[setup] using the caller-configured uv package index."
+index_url="${PIP_INDEX_URL:-${UV_INDEX_URL:-${UV_DEFAULT_INDEX:-}}}"
+if [[ -z "$index_url" ]] && command -v pip3 >/dev/null; then
+  index_url="$(pip3 config get global.index-url 2>/dev/null || true)"
+fi
+if [[ -n "$index_url" ]]; then
+  export PIP_INDEX_URL="$index_url" UV_INDEX_URL="$index_url" UV_DEFAULT_INDEX="$index_url"
 fi
 
 port_listening() {
@@ -150,10 +142,9 @@ tracked_process_alive() {
   [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null || return 1
   started="$(awk -F '\t' -v target_name="$name" -v target_port="$port" \
     '$1 == target_name && $2 == target_port { value = $4 } END { print value }' "$STATE_FILE")"
-  if [[ -n "$started" ]]; then
-    current="$(process_started_at "$pid")"
-    [[ -n "$current" && "$current" == "$started" ]] || return 1
-  fi
+  [[ -n "$started" ]] || return 1
+  current="$(process_started_at "$pid")"
+  [[ -n "$current" && "$current" == "$started" ]] || return 1
 }
 
 tail_logs() {
@@ -210,8 +201,12 @@ start_tracked() {
   ) >"$stdout" 2>"$stderr" &
   local pid=$!
   local started_at
-  started_at="$(process_started_at "$pid")"
+  started_at="$(process_started_at "$pid")" || started_at=""
   printf '%s\t%s\t%s\t%s\n' "$name" "$port" "$pid" "$started_at" >>"$STATE_FILE"
+  if [[ -z "$started_at" ]]; then
+    echo "Could not record process identity for $name. Verify PID $pid manually." >&2
+    return 1
+  fi
 }
 
 track_alias() {
@@ -367,16 +362,20 @@ NODE
     if [[ "$FORCE_CLEAN" == "1" && -d "$skill_dir/.venv" ]]; then
       rm -rf "$skill_dir/.venv"
     fi
-    start_tracked "$name" "$port" "$skill_dir" uv run func start --port "$port" ||
-      fail_and_stop "[$name] could not start on port $port."
+    for attempt in 1 2; do
+      start_tracked "$name" "$port" "$skill_dir" uv run func start --port "$port" ||
+        fail_and_stop "[$name] could not start on port $port."
+      if wait_port "$name" "$port"; then
+        break
+      fi
+      if ((attempt == 1)) && ! tracked_process_alive "$name" "$port" &&
+        grep -Fq "Value cannot be null. (Parameter 'provider')" "$LOG_DIR/$name.err.log"; then
+        echo "[$name] Azure Functions Core Tools reported a startup provider error. Retrying once." >&2
+        continue
+      fi
+      fail_and_stop "[$name] failed to start. The agent and web app were not started."
+    done
   done
-
-  skills_ready=1
-  for i in "${!skill_names[@]}"; do
-    wait_port "${skill_names[$i]}" "${skill_ports[$i]}" || skills_ready=0
-  done
-  ((skills_ready == 1)) ||
-    fail_and_stop "One or more Hosted Skills failed to start. The agent and web app were not started."
 fi
 
 if ((SKIP_AGENT == 0)); then

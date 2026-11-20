@@ -1,106 +1,180 @@
-#!/usr/bin/env pwsh
-<#
-.SYNOPSIS
-    Stops everything this workspace's dev-start.ps1 recorded.
+param(
+  [Parameter(ValueFromRemainingArguments = $true)]
+  [string[]] $RuntimeArguments
+)
 
-.DESCRIPTION
-    `func start` and `npm run dev` both spawn child processes, so killing
-    only the PID Start-Process handed back can leave orphans behind. This
-    script kills each recorded launcher's process tree, but never sweeps
-    ports or terminates an untracked process from another Azure App Platform workspace.
-
-.EXAMPLE
-    .\scripts\dev-stop.ps1
-    Stops the tracked Azurite, skills, agent, and web app process trees.
-#>
-[CmdletBinding()]
-param()
-
-$RepoRoot = if ($env:DEALER_REPO_ROOT) { $env:DEALER_REPO_ROOT } else { Split-Path -Parent $PSScriptRoot }
-$RunDir = Join-Path $RepoRoot '.dev-run'
-$StateFile = Join-Path $RunDir 'processes.json'
-
-function Stop-ProcessTree {
-    param([int]$ProcessId)
-    try {
-        # taskkill /T kills the whole tree (parent + children), which
-        # Stop-Process alone does not do - needed for func.exe/node.exe
-        # child workers spawned by func start / npm run dev.
-        & taskkill /PID $ProcessId /T /F 2>$null | Out-Null
-        return $LASTEXITCODE -eq 0
-    } catch {
-        return $false
+$ErrorActionPreference = "Stop"
+foreach ($Argument in @($RuntimeArguments)) {
+  if (-not $Argument) { continue }
+  switch ($Argument) {
+    "--help" {
+      Write-Host "Usage: .\scripts\dev-stop.ps1"
+      exit 0
     }
-}
-
-Write-Host "=== dev-stop ===" -ForegroundColor Green
-
-$stoppedAny = $false
-$stoppedPids = @{}
-$protectedPids = @{}
-$ancestorPid = [int]$PID
-while ($ancestorPid -gt 0 -and -not $protectedPids.ContainsKey($ancestorPid)) {
-    $protectedPids[$ancestorPid] = $true
-    try {
-        $ancestor = Get-CimInstance Win32_Process -Filter "ProcessId=$ancestorPid" -ErrorAction Stop
-        $ancestorPid = [int]$ancestor.ParentProcessId
-    } catch {
-        break
+    "-h" {
+      Write-Host "Usage: .\scripts\dev-stop.ps1"
+      exit 0
     }
-}
-
-# Stop launchers recorded immediately by dev-start.ps1. This catches failed
-# or still-booting processes that never reached LISTEN state.
-if (Test-Path $StateFile) {
-    try {
-        $tracked = @(Get-Content $StateFile -Raw | ConvertFrom-Json)
-        foreach ($entry in $tracked) {
-            $trackedPid = 0
-            if (
-                -not $entry.pid -or
-                -not [int]::TryParse("$($entry.pid)", [ref]$trackedPid) -or
-                $trackedPid -le 1 -or
-                $protectedPids.ContainsKey($trackedPid)
-            ) {
-                if ($entry.pid) {
-                    Write-Host ("{0,-18} tracked pid {1,-6} SKIPPED (protected or invalid PID)" -f $entry.name, $entry.pid) -ForegroundColor Yellow
-                }
-                continue
-            }
-            if ($stoppedPids.ContainsKey($trackedPid)) {
-                continue
-            }
-            $proc = Get-Process -Id $trackedPid -ErrorAction SilentlyContinue
-            if ($proc) {
-                if ($entry.startedAt) {
-                    $actualStart = $proc.StartTime.ToUniversalTime().ToString('O')
-                    if ($actualStart -ne $entry.startedAt) {
-                        Write-Host ("{0,-18} tracked pid {1,-6} SKIPPED (PID was reused)" -f $entry.name, $entry.pid) -ForegroundColor Yellow
-                        continue
-                    }
-                }
-                $ok = Stop-ProcessTree -ProcessId $trackedPid
-                $stoppedPids[$trackedPid] = $true
-                if ($ok) {
-                    $stoppedAny = $true
-                    Write-Host ("{0,-18} tracked pid {1,-6} STOPPED ({2})" -f $entry.name, $entry.pid, $proc.ProcessName) -ForegroundColor Yellow
-                } else {
-                    Write-Host ("{0,-18} tracked pid {1,-6} FAILED to stop ({2})" -f $entry.name, $entry.pid, $proc.ProcessName) -ForegroundColor Red
-                }
-            }
-        }
-    } catch {
-        Write-Host "Could not read process state; no untracked processes will be stopped." -ForegroundColor Yellow
+    default {
+      Write-Error "Unknown option: $Argument"
+      exit 2
     }
+  }
 }
 
-if (Test-Path $StateFile) {
-    Remove-Item $StateFile -Force
+$Root = if ($env:DEALER_REPO_ROOT) { $env:DEALER_REPO_ROOT } else { Split-Path -Parent $PSScriptRoot }
+$RunDir = Join-Path $Root ".dev-run"
+$State = Join-Path $RunDir "processes.json"
+$NextState = Join-Path $RunDir "processes.next.json"
+
+function Write-StopError {
+  param([string] $Message)
+  [Console]::Error.WriteLine($Message)
 }
 
-Write-Host ""
-if ($stoppedAny) {
-    Write-Host "Done. This workspace's tracked process trees were stopped." -ForegroundColor Green
+function Get-ProcessStartIdentity {
+  param([int] $ProcessId)
+  $Process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+  if (-not $Process) {
+    return $null
+  }
+  try {
+    return $Process.StartTime.ToUniversalTime().ToString("O")
+  } catch {
+    throw "Could not read start identity for PID $ProcessId."
+  }
+}
+
+function Stop-ExactProcessTree {
+  param(
+    [int] $ProcessId,
+    [string] $ExpectedStart
+  )
+
+  if ((Get-ProcessStartIdentity $ProcessId) -ne $ExpectedStart) {
+    return $true
+  }
+  try {
+    & taskkill.exe /PID $ProcessId /T /F 2>$null | Out-Null
+  } catch { }
+  for ($Attempt = 0; $Attempt -lt 20; $Attempt++) {
+    if ((Get-ProcessStartIdentity $ProcessId) -ne $ExpectedStart) {
+      return $true
+    }
+    Start-Sleep -Milliseconds 100
+  }
+  return (Get-ProcessStartIdentity $ProcessId) -ne $ExpectedStart
+}
+
+$ProtectedPids = @{}
+$AncestorLookupFailed = $false
+$AncestorPid = [int]$PID
+while ($AncestorPid -gt 0 -and -not $ProtectedPids.ContainsKey($AncestorPid)) {
+  $ProtectedPids[$AncestorPid] = $true
+  try {
+    $Ancestor = Get-CimInstance Win32_Process -Filter "ProcessId=$AncestorPid" -ErrorAction Stop
+    $AncestorPid = [int]$Ancestor.ParentProcessId
+  } catch {
+    $AncestorLookupFailed = $true
+    break
+  }
+}
+
+$Remaining = @()
+$StoppedPids = @{}
+$Failed = $false
+$StoppedAny = $false
+
+if (Test-Path $State) {
+  try {
+    $Items = @(Get-Content $State -Raw | ConvertFrom-Json)
+  } catch {
+    Write-StopError "Could not read $State. No process was signaled; repair or remove the registry manually."
+    exit 1
+  }
+
+  foreach ($Item in $Items) {
+    $TrackedPid = 0
+    if (-not $Item.pid -or -not [int]::TryParse("$($Item.pid)", [ref]$TrackedPid) -or $TrackedPid -le 1) {
+      $Remaining += $Item
+      Write-StopError "[$($Item.name)] invalid tracked PID '$($Item.pid)'. Verify it manually, then repair or remove $State."
+      $Failed = $true
+      continue
+    }
+
+    try {
+      $CurrentStart = Get-ProcessStartIdentity $TrackedPid
+    } catch {
+      $Remaining += $Item
+      Write-StopError "[$($Item.name)] could not verify start identity for PID $TrackedPid. Refusing to signal it; the registry was preserved."
+      $Failed = $true
+      continue
+    }
+    if (-not $CurrentStart) {
+      continue
+    }
+    $RecordedStart = if ($Item.startedAt -is [DateTime]) {
+      $Item.startedAt.ToUniversalTime().ToString("O")
+    } else {
+      [string]$Item.startedAt
+    }
+    if (-not $RecordedStart) {
+      $Remaining += $Item
+      Write-StopError "[$($Item.name)] PID $TrackedPid has no recorded start identity. Refusing to signal it; verify and stop it manually, then remove $State."
+      $Failed = $true
+      continue
+    }
+    $Item.startedAt = $RecordedStart
+    if ($CurrentStart -ne $RecordedStart) {
+      Write-Host "[$($Item.name)] skipped stale PID $TrackedPid because its start identity changed (PID was reused)."
+      continue
+    }
+    if ($AncestorLookupFailed) {
+      $Remaining += $Item
+      Write-StopError "[$($Item.name)] could not verify shell ancestors. Refusing to signal PID $TrackedPid; the registry was preserved."
+      $Failed = $true
+      continue
+    }
+    if ($ProtectedPids.ContainsKey($TrackedPid)) {
+      $Remaining += $Item
+      Write-StopError "[$($Item.name)] refusing to stop PID $TrackedPid because it is this PowerShell process or an ancestor. The registry was preserved."
+      $Failed = $true
+      continue
+    }
+    if ($StoppedPids.ContainsKey($TrackedPid)) {
+      continue
+    }
+
+    try {
+      $Stopped = Stop-ExactProcessTree -ProcessId $TrackedPid -ExpectedStart $RecordedStart
+    } catch {
+      $Stopped = $false
+    }
+    if ($Stopped) {
+      $StoppedPids[$TrackedPid] = $true
+      $StoppedAny = $true
+      Write-Host "[$($Item.name)] stopped tracked PID $TrackedPid."
+    } else {
+      $Remaining += $Item
+      Write-StopError "[$($Item.name)] failed to stop PID $TrackedPid after bounded taskkill polling. The registry was preserved for retry."
+      $Failed = $true
+    }
+  }
+}
+
+if ($Failed) {
+  @($Remaining) | ConvertTo-Json | Set-Content $NextState
+  Move-Item -Force $NextState $State
+  Write-StopError "Dealership stop incomplete; resolve the errors above and rerun dev-stop.ps1."
+  exit 1
+}
+
+if (Test-Path $State) {
+  Remove-Item -LiteralPath $State -Force
+}
+if ($StoppedAny) {
+  Write-Host "Dealership stopped."
 } else {
-    Write-Host "No live processes owned by this workspace were recorded." -ForegroundColor Green
+  Write-Host "Dealership was not running."
 }
+exit 0

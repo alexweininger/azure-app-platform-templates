@@ -289,36 +289,9 @@ and financing-handoff behavior.
 
 See [`../TESTING.md`](../TESTING.md) for the full test matrix.
 
-### Corporate network / proxy note
+### Python package index
 
-`uv` does not read `pip`'s configured index (`pip.conf` / `PIP_INDEX_URL`) the
-way `pip` does, so on a Microsoft corp network it falls back to the public
-`files.pythonhosted.org` CDN, which the corp proxy blocks (fails with
-`Recv failure: Socket is not connected`, on or off VPN). If `uv run` fails
-fetching packages, point it at the same internal mirror `pip` already uses:
-
-```bash
-export UV_INDEX_URL="$(pip3 config list 2>/dev/null | sed -n "s/global.index-url='\(.*\)'/\1/p")"
-export UV_DEFAULT_INDEX="$UV_INDEX_URL"
-```
-
-or hardcode it directly if `pip3 config list` returns nothing:
-
-```bash
-export UV_INDEX_URL=https://pypi.org/simple/
-export UV_DEFAULT_INDEX=https://pypi.org/simple/
-```
-
-PowerShell:
-
-```powershell
-$env:UV_INDEX_URL = python -m pip config get global.index-url 2>$null
-if (-not $env:UV_INDEX_URL) {
-  $env:UV_INDEX_URL = "https://pypi.org/simple/"
-}
-$env:UV_DEFAULT_INDEX = $env:UV_INDEX_URL
-```
-
-`scripts/dev-start.ps1` automates this exact resolution before starting any
-component: it respects an existing uv index, otherwise uses pip's configured
-index, otherwise falls back to the Microsoft package feed proxy.
+The startup scripts use `PIP_INDEX_URL`, then `UV_INDEX_URL`, then
+`UV_DEFAULT_INDEX`. If none is set, they check pip's configured index. When no
+index is configured, `uv` uses its default. Set an approved package index and
+proxy or certificate settings if your network requires them.

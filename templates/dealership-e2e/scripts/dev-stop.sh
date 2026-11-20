@@ -2,25 +2,35 @@
 set -u
 
 SCRIPT_DIR="${DEALER_SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-REPO_ROOT="${DEALER_REPO_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
-STATE_FILE="$REPO_ROOT/.dev-run/processes.posix.tsv"
+ROOT="${DEALER_REPO_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+RUN_DIR="$ROOT/.dev-run"
+STATE_FILE="$RUN_DIR/processes.posix.tsv"
+NEXT_STATE="$STATE_FILE.next.$$"
+PS_COMMAND="${APP_PLATFORM_PS_COMMAND:-ps}"
+PGREP_COMMAND="${APP_PLATFORM_PGREP_COMMAND:-pgrep}"
+KILL_COMMAND="${APP_PLATFORM_KILL_COMMAND:-kill}"
+SLEEP_COMMAND="${APP_PLATFORM_SLEEP_COMMAND:-sleep}"
 
-stopped_pids=" "
-stopped_any=0
-
-pid_stopped() {
-  case "$stopped_pids" in
-    *" $1 "*) return 0 ;;
-    *) return 1 ;;
+for argument in "$@"; do
+  case "$argument" in
+    --help|-h)
+      echo "Usage: ./scripts/dev-stop.sh"
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $argument" >&2
+      exit 2
+      ;;
   esac
-}
-
-remember_pid() {
-  stopped_pids="${stopped_pids}$1 "
-}
+done
 
 process_started_at() {
-  ps -p "$1" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+  "$PS_COMMAND" -p "$1" -o lstart= 2>/dev/null |
+    sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+parent_pid() {
+  "$PS_COMMAND" -p "$1" -o ppid= 2>/dev/null | tr -d '[:space:]'
 }
 
 is_protected_pid() {
@@ -28,59 +38,124 @@ is_protected_pid() {
   [[ "$candidate" =~ ^[0-9]+$ ]] && ((candidate > 1)) || return 0
   while [[ "$current" =~ ^[0-9]+$ ]] && ((current > 1)); do
     [[ "$candidate" == "$current" ]] && return 0
-    parent="$(ps -p "$current" -o ppid= 2>/dev/null | tr -d '[:space:]')"
-    [[ -n "$parent" && "$parent" != "$current" ]] || break
+    parent="$(parent_pid "$current")"
+    [[ "$parent" =~ ^[0-9]+$ ]] && [[ "$parent" != "$current" ]] || break
     current="$parent"
   done
   return 1
 }
 
-kill_tree() {
-  local pid="$1" child
-  if ! kill -0 "$pid" 2>/dev/null; then
-    return 0
-  fi
-  while read -r child; do
-    [[ -n "$child" ]] && kill_tree "$child"
-  done < <(pgrep -P "$pid" 2>/dev/null || true)
-  kill "$pid" 2>/dev/null || true
-  for _ in {1..20}; do
-    kill -0 "$pid" 2>/dev/null || return 0
-    sleep 0.1
-  done
-  kill -9 "$pid" 2>/dev/null || true
-  sleep 0.1
-  ! kill -0 "$pid" 2>/dev/null
+process_matches() {
+  local current
+  current="$(process_started_at "$1")"
+  [[ -n "$current" && "$current" == "$2" ]]
 }
 
-echo "=== dev-stop ==="
+kill_tree() {
+  local pid="$1" expected_start="$2" child child_start
+  process_matches "$pid" "$expected_start" || return 0
+
+  while read -r child; do
+    [[ "$child" =~ ^[0-9]+$ ]] || continue
+    if is_protected_pid "$child"; then
+      echo "Refusing to stop protected descendant PID $child." >&2
+      return 1
+    fi
+    child_start="$(process_started_at "$child")"
+    [[ -n "$child_start" ]] || continue
+    kill_tree "$child" "$child_start" || return 1
+  done < <("$PGREP_COMMAND" -P "$pid" 2>/dev/null || true)
+
+  process_matches "$pid" "$expected_start" || return 0
+  "$KILL_COMMAND" "$pid" 2>/dev/null || true
+  for _ in {1..20}; do
+    process_matches "$pid" "$expected_start" || return 0
+    "$SLEEP_COMMAND" 0.1
+  done
+
+  process_matches "$pid" "$expected_start" || return 0
+  "$KILL_COMMAND" -9 "$pid" 2>/dev/null || true
+  for _ in {1..10}; do
+    process_matches "$pid" "$expected_start" || return 0
+    "$SLEEP_COMMAND" 0.1
+  done
+  ! process_matches "$pid" "$expected_start"
+}
+
+failures=0
+stopped_any=0
+stopped_pids=" "
+if [[ ! -f "$STATE_FILE" ]]; then
+  echo "Dealership was not running."
+  exit 0
+fi
+trap 'rm -f "$NEXT_STATE"' EXIT
+if ! : >"$NEXT_STATE"; then
+  echo "Could not write the process registry. No process was signaled." >&2
+  exit 1
+fi
 
 if [[ -f "$STATE_FILE" ]]; then
   while IFS=$'\t' read -r name port pid started_at; do
-    if [[ -n "$pid" ]] && is_protected_pid "$pid"; then
-      printf '%-18s tracked pid %-6s SKIPPED (protected or invalid PID)\n' "$name" "$pid"
+    [[ -n "${name}${port}${pid}${started_at}" ]] || continue
+    if [[ ! "$pid" =~ ^[0-9]+$ ]] || ((10#$pid <= 1)); then
+      printf '%s\t%s\t%s\t%s\n' "$name" "$port" "$pid" "$started_at" >>"$NEXT_STATE"
+      echo "[$name] invalid tracked PID '$pid'. Verify it manually, then repair or remove $STATE_FILE." >&2
+      failures=1
       continue
     fi
-    if [[ -n "$pid" ]] && ! pid_stopped "$pid" && kill -0 "$pid" 2>/dev/null; then
-      if [[ -n "$started_at" && "$(process_started_at "$pid")" != "$started_at" ]]; then
-        printf '%-18s tracked pid %-6s SKIPPED (PID was reused)\n' "$name" "$pid"
+
+    current_start="$(process_started_at "$pid")"
+    if [[ -z "$current_start" ]]; then
+      continue
+    fi
+    if [[ -z "$started_at" ]]; then
+      printf '%s\t%s\t%s\t\n' "$name" "$port" "$pid" >>"$NEXT_STATE"
+      echo "[$name] PID $pid has no recorded start identity. Refusing to signal it; verify and stop it manually, then remove $STATE_FILE." >&2
+      failures=1
+      continue
+    fi
+    if [[ "$current_start" != "$started_at" ]]; then
+      echo "[$name] skipped stale PID $pid because its start identity changed (PID was reused)."
+      continue
+    fi
+    if is_protected_pid "$pid"; then
+      printf '%s\t%s\t%s\t%s\n' "$name" "$port" "$pid" "$started_at" >>"$NEXT_STATE"
+      echo "[$name] refusing to stop PID $pid because it is this shell or an ancestor. The registry was preserved." >&2
+      failures=1
+      continue
+    fi
+    case "$stopped_pids" in
+      *" $pid "*)
         continue
-      fi
-      if ! kill_tree "$pid"; then
-        printf '%-18s tracked pid %-6s FAILED to stop\n' "$name" "$pid" >&2
-        continue
-      fi
-      remember_pid "$pid"
+        ;;
+    esac
+    if kill_tree "$pid" "$started_at"; then
+      stopped_pids="${stopped_pids}${pid} "
       stopped_any=1
-      printf '%-18s tracked pid %-6s STOPPED\n' "$name" "$pid"
+      echo "[$name] stopped tracked PID $pid."
+    else
+      printf '%s\t%s\t%s\t%s\n' "$name" "$port" "$pid" "$started_at" >>"$NEXT_STATE"
+      echo "[$name] failed to stop PID $pid after bounded TERM/KILL polling. The registry was preserved for retry." >&2
+      failures=1
     fi
   done <"$STATE_FILE"
 fi
 
-rm -f "$STATE_FILE"
-echo
+if ((failures)); then
+  mv "$NEXT_STATE" "$STATE_FILE"
+  trap - EXIT
+  echo "Dealership stop incomplete; resolve the errors above and rerun dev-stop.sh." >&2
+  exit 1
+fi
+
+if ! rm -f "$STATE_FILE" "$NEXT_STATE"; then
+  echo "Could not remove the process registry." >&2
+  exit 1
+fi
+trap - EXIT
 if ((stopped_any)); then
-  echo "Done. This workspace's tracked process trees were stopped."
+  echo "Dealership stopped."
 else
-  echo "No live processes owned by this workspace were recorded."
+  echo "Dealership was not running."
 fi

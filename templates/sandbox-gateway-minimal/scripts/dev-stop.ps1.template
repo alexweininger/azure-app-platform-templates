@@ -118,13 +118,13 @@ if (Test-Path $State) {
     } else {
       [string]$Item.startedAt
     }
-    $Item.startedAt = $RecordedStart
     if (-not $RecordedStart) {
       $Remaining += $Item
       Write-StopError "[$($Item.name)] PID $TrackedPid has no recorded start identity. Refusing to signal it; verify and stop it manually, then remove $State."
       $Failed = $true
       continue
     }
+    $Item.startedAt = $RecordedStart
     if ($CurrentStart -ne $RecordedStart) {
       Write-Host "[$($Item.name)] skipped stale PID $TrackedPid because its start identity changed (PID was reused)."
       continue

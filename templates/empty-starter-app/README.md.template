@@ -53,6 +53,7 @@ Stop this app with:
 .\scripts\dev-stop.ps1
 ```
 
-The startup script uses the Microsoft Python package mirror and starts the local
-mock agent and web surface. To include the Hosted Skill, install Azure Functions
+The startup script starts the local mock agent and web surface. It uses
+`PIP_INDEX_URL`, `UV_INDEX_URL`, or `UV_DEFAULT_INDEX` when set; otherwise,
+`uv` uses its default. To include the Hosted Skill, install Azure Functions
 Core Tools first, then omit `--skip-skill` / `-SkipSkill`.

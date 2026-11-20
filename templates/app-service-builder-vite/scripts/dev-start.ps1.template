@@ -19,11 +19,10 @@ $env:WEB_PORT = "$WebPort"
 $env:AGENT_PORT = "$AgentPort"
 $env:AGENT_URL = "http://127.0.0.1:$AgentPort"
 & (Join-Path $PSScriptRoot "dev-stop.ps1") | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "The previous app processes could not be stopped safely." }
 New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
-Remove-Item Env:UV_FROZEN, Env:UV_LOCKED, Env:UV_OFFLINE, Env:UV_NO_SYNC, Env:UV_EXTRA_INDEX_URL -ErrorAction SilentlyContinue
-$env:UV_INDEX_URL = if ($env:UV_INDEX_URL) { $env:UV_INDEX_URL } else { "https://pypi.org/simple/" }
-$env:UV_DEFAULT_INDEX = $env:UV_INDEX_URL
-$env:PIP_INDEX_URL = if ($env:PIP_INDEX_URL) { $env:PIP_INDEX_URL } else { $env:UV_INDEX_URL }
+$IndexUrl = if ($env:PIP_INDEX_URL) { $env:PIP_INDEX_URL } elseif ($env:UV_INDEX_URL) { $env:UV_INDEX_URL } else { $env:UV_DEFAULT_INDEX }
+if ($IndexUrl) { $env:PIP_INDEX_URL = $env:UV_INDEX_URL = $env:UV_DEFAULT_INDEX = $IndexUrl }
 
 function Wait-Port($Name, $Port, $Process) {
   for ($i = 0; $i -lt 200; $i++) {
@@ -49,7 +48,10 @@ if ($ForceClean) {
 
 if (-not (Test-Path (Join-Path $Root "node_modules/vite"))) {
   Push-Location $Root
-  try { npm install --prefer-offline --ignore-scripts --no-audit --no-fund } finally { Pop-Location }
+  try {
+    npm install --prefer-offline --ignore-scripts --no-audit --no-fund
+    if ($LASTEXITCODE -ne 0) { throw "Web dependency installation failed (exit $LASTEXITCODE)." }
+  } finally { Pop-Location }
 }
 $DistIndex = Join-Path $Root "dist/index.html"
 $NeedsBuild = $ForceClean -or (-not (Test-Path $DistIndex))
@@ -64,10 +66,25 @@ if (-not $NeedsBuild) {
 }
 if ($NeedsBuild) {
   Push-Location $Root
-  try { npm run build } finally { Pop-Location }
+  try {
+    npm run build
+    if ($LASTEXITCODE -ne 0) { throw "Web build failed (exit $LASTEXITCODE)." }
+  } finally { Pop-Location }
 }
 
 $processes = @()
+function Save-ProcessState {
+  if ($script:processes.Count -eq 0) { Set-Content (Join-Path $RunDir "processes.json") "[]" }
+  else { @($script:processes) | ConvertTo-Json | Set-Content (Join-Path $RunDir "processes.json") }
+}
+function Register-TrackedProcess($Name, $Port, $Process) {
+  $record = @{ name = $Name; port = $Port; pid = $Process.Id; startedAt = $null }
+  $script:processes += $record
+  Save-ProcessState
+  try { $record.startedAt = $Process.StartTime.ToUniversalTime().ToString("O") }
+  catch { throw "Could not record process identity for $Name. Verify PID $($Process.Id) manually." }
+  Save-ProcessState
+}
 try {
   if (-not $SkipSkill -and (Test-Path (Join-Path $Root "src/skills"))) {
     $SkillIndex = 0
@@ -75,19 +92,21 @@ try {
       if (-not (Test-Path (Join-Path $SkillDir.FullName "function_app.py"))) { continue }
       $CurrentSkillPort = $SkillPort + $SkillIndex
       $SkillIndex++
-      if ((Get-Command uv -ErrorAction SilentlyContinue) -and (Get-Command func -ErrorAction SilentlyContinue)) {
-        if ($ForceClean -and (Test-Path (Join-Path $SkillDir.FullName ".venv"))) {
-          Remove-Item -Recurse -Force (Join-Path $SkillDir.FullName ".venv")
-        }
-        $skillArgs = if (Test-Path (Join-Path $SkillDir.FullName "pyproject.toml")) {
-          @("run", "func", "start", "--port", "$CurrentSkillPort")
-        } else {
-          @("run", "--with-requirements", "requirements.txt", "func", "start", "--port", "$CurrentSkillPort")
-        }
-        $skill = Start-Process uv -ArgumentList $skillArgs -WorkingDirectory $SkillDir.FullName -WindowStyle Hidden -PassThru
-        $processes += @{ name = $SkillDir.Name; port = $CurrentSkillPort; pid = $skill.Id }
-        Wait-Port $SkillDir.Name $CurrentSkillPort $skill
+      if (-not (Get-Command uv -ErrorAction SilentlyContinue)) { throw "uv is required to run $($SkillDir.Name)." }
+      $func = if (Get-Command func.cmd -ErrorAction SilentlyContinue) { "func.cmd" }
+        elseif (Get-Command func -ErrorAction SilentlyContinue) { "func" }
+        else { throw "Azure Functions Core Tools is required to run $($SkillDir.Name)." }
+      if ($ForceClean -and (Test-Path (Join-Path $SkillDir.FullName ".venv"))) {
+        Remove-Item -Recurse -Force (Join-Path $SkillDir.FullName ".venv")
       }
+      $skillArgs = if (Test-Path (Join-Path $SkillDir.FullName "pyproject.toml")) {
+        @("run", $func, "start", "--port", "$CurrentSkillPort")
+      } else {
+        @("run", "--with-requirements", "requirements.txt", $func, "start", "--port", "$CurrentSkillPort")
+      }
+      $skill = Start-Process uv -ArgumentList $skillArgs -WorkingDirectory $SkillDir.FullName -WindowStyle Hidden -PassThru
+      Register-TrackedProcess $SkillDir.Name $CurrentSkillPort $skill
+      Wait-Port $SkillDir.Name $CurrentSkillPort $skill
     }
   }
 
@@ -104,22 +123,21 @@ try {
       Remove-Item -Recurse -Force (Join-Path $AgentDir ".venv")
     }
     $agent = Start-Process uv -ArgumentList "run", "main.py" -WorkingDirectory $AgentDir -WindowStyle Hidden -PassThru
-    $processes += @{ name = "agent"; port = $AgentPort; pid = $agent.Id }
+    Register-TrackedProcess "agent" $AgentPort $agent
     Wait-Port "agent" $AgentPort $agent
   }
 
   $npxCmd = if ($IsWindows) { "npx.cmd" } else { "npx" }
   $web = Start-Process -FilePath $npxCmd -ArgumentList @("vite", "preview", "--host", "127.0.0.1", "--port", "$WebPort", "--strictPort") -WorkingDirectory $Root -WindowStyle Hidden -PassThru
-  $processes += @{ name = "web"; port = $WebPort; pid = $web.Id }
+  Register-TrackedProcess "web" $WebPort $web
   Wait-Port "web" $WebPort $web
-  $processes | ConvertTo-Json | Set-Content -Path (Join-Path $RunDir "processes.json")
   if ($AgentDir) {
     Write-Output "__APP_NAME__ started: web http://localhost:$WebPort, agent http://localhost:$AgentPort"
   } else {
     Write-Output "__APP_NAME__ started: web http://localhost:$WebPort"
   }
 } catch {
-  $processes | ConvertTo-Json | Set-Content -Path (Join-Path $RunDir "processes.json")
+  Save-ProcessState
   & (Join-Path $PSScriptRoot "dev-stop.ps1")
   throw
 }

@@ -10,14 +10,11 @@ $WebPort = if ($env:WEB_PORT) { [int]$env:WEB_PORT } else { 8080 }
 $AgentPort = if ($env:AGENT_PORT) { [int]$env:AGENT_PORT } else { 8088 }
 
 & (Join-Path $PSScriptRoot "dev-stop.ps1") | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "The previous app processes could not be stopped safely." }
 New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
 
-Remove-Item Env:UV_FROZEN, Env:UV_LOCKED, Env:UV_OFFLINE, Env:UV_NO_SYNC, Env:UV_EXTRA_INDEX_URL -ErrorAction SilentlyContinue
-if (-not $env:UV_DEFAULT_INDEX) {
-  $env:UV_DEFAULT_INDEX = if ($env:UV_INDEX_URL) { $env:UV_INDEX_URL } else { "https://pypi.org/simple/" }
-}
-$env:UV_INDEX_URL = $env:UV_DEFAULT_INDEX
-$env:PIP_INDEX_URL = if ($env:PIP_INDEX_URL) { $env:PIP_INDEX_URL } else { $env:UV_INDEX_URL }
+$IndexUrl = if ($env:PIP_INDEX_URL) { $env:PIP_INDEX_URL } elseif ($env:UV_INDEX_URL) { $env:UV_INDEX_URL } else { $env:UV_DEFAULT_INDEX }
+if ($IndexUrl) { $env:PIP_INDEX_URL = $env:UV_INDEX_URL = $env:UV_DEFAULT_INDEX = $IndexUrl }
 
 foreach ($envCandidate in @((Join-Path $Root ".env"), (Join-Path $Root "src/agent/.env"))) {
   if (Test-Path $envCandidate) {
@@ -33,6 +30,18 @@ foreach ($envCandidate in @((Join-Path $Root ".env"), (Join-Path $Root "src/agen
 }
 
 $processes = @()
+function Save-ProcessState {
+  if ($script:processes.Count -eq 0) { Set-Content (Join-Path $RunDir "processes.json") "[]" }
+  else { @($script:processes) | ConvertTo-Json | Set-Content (Join-Path $RunDir "processes.json") }
+}
+function Register-TrackedProcess($Name, $Port, $Process) {
+  $record = @{ name = $Name; port = $Port; pid = $Process.Id; startedAt = $null }
+  $script:processes += $record
+  Save-ProcessState
+  try { $record.startedAt = $Process.StartTime.ToUniversalTime().ToString("O") }
+  catch { throw "Could not record process identity for $Name. Verify PID $($Process.Id) manually." }
+  Save-ProcessState
+}
 try {
   $AgentMain = Join-Path $Root "src/agent/main.py"
   if (Test-Path $AgentMain) {
@@ -50,19 +59,24 @@ try {
       -RedirectStandardOutput (Join-Path $RunDir "agent.log") `
       -RedirectStandardError (Join-Path $RunDir "agent.err.log") `
       -PassThru
-    $processes += @{ name = "agent"; port = $AgentPort; pid = $agentProc.Id }
-    $processes | ConvertTo-Json | Set-Content -Path (Join-Path $RunDir "processes.json")
+    Register-TrackedProcess "agent" $AgentPort $agentProc
+    $agentReady = $false
+    $agentError = "No HTTP response."
     for ($i = 0; $i -lt 120; $i++) {
       if ($agentProc.HasExited) { throw "Backend agent exited before opening port $AgentPort" }
       try {
-        $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$AgentPort/healthz" -UseBasicParsing -TimeoutSec 2
-        if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 500) {
+        $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$AgentPort/healthz" -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 2
+        if ($resp.StatusCode -eq 200) {
           Write-Host "Backend agent ready on http://127.0.0.1:$AgentPort"
+          $agentReady = $true
           break
         }
-      } catch {}
+        $agentError = "HTTP $($resp.StatusCode)"
+      } catch [System.Net.Http.HttpRequestException] { $agentError = $_.Exception.Message }
+        catch [System.Threading.Tasks.TaskCanceledException] { $agentError = $_.Exception.Message }
       Start-Sleep -Milliseconds 150
     }
+    if (-not $agentReady) { throw "Backend agent did not become ready on port $AgentPort`: $agentError" }
   }
 
   if ($ForceClean -and (Test-Path (Join-Path $Root ".venv"))) {
@@ -77,25 +91,26 @@ try {
     -RedirectStandardError (Join-Path $RunDir "web.err.log") `
     -PassThru
 
-  $processes += @{ name = "web"; port = $WebPort; pid = $proc.Id }
-  $processes | ConvertTo-Json | Set-Content -Path (Join-Path $RunDir "processes.json")
+  Register-TrackedProcess "web" $WebPort $proc
 
+  $webError = "No HTTP response."
   for ($i = 0; $i -lt 120; $i++) {
     if ($proc.HasExited) { throw "App Service Builder AI Gateway app exited before opening port $WebPort" }
     try {
-      $response = Invoke-WebRequest -Uri "http://127.0.0.1:$WebPort/health" -UseBasicParsing -TimeoutSec 2
-      if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) {
+      $response = Invoke-WebRequest -Uri "http://127.0.0.1:$WebPort/health" -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 2
+      if ($response.StatusCode -eq 200) {
         Write-Host "App Service Builder AI Gateway app ready on http://127.0.0.1:$WebPort"
         exit 0
       }
-    } catch {}
+      $webError = "HTTP $($response.StatusCode)"
+    } catch [System.Net.Http.HttpRequestException] { $webError = $_.Exception.Message }
+      catch [System.Threading.Tasks.TaskCanceledException] { $webError = $_.Exception.Message }
     Start-Sleep -Milliseconds 150
   }
 
-  Write-Error "App Service Builder AI Gateway app did not become ready on port $WebPort."
-  exit 1
+  throw "App Service Builder AI Gateway app did not become ready on port $WebPort`: $webError"
 } catch {
-  $processes | ConvertTo-Json | Set-Content -Path (Join-Path $RunDir "processes.json")
+  Save-ProcessState
   & (Join-Path $PSScriptRoot "dev-stop.ps1")
   throw
 }
